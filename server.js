@@ -362,7 +362,12 @@ async function fetchSteamNewReleases() {
       start += pageSize;
       await new Promise((r) => setTimeout(r, 400));
     } catch (err) {
-      console.warn('fetchSteamNewReleases page error:', err?.message);
+      const msg = err?.message || '';
+      if (msg.includes('timeout') || msg.includes('aborted')) {
+        console.warn('fetchSteamNewReleases page timeout (will use SteamSpy supplement if needed):', msg.slice(0, 60));
+      } else {
+        console.warn('fetchSteamNewReleases page error:', msg);
+      }
       break;
     }
   }
@@ -868,13 +873,26 @@ function formatDiffSummary(diff, lang = 'en-US') {
 const SNAPSHOT_KEY_PREFIX = 'steam_sense:snapshot:';
 const DIFF_KEY_PREFIX = 'steam_sense:diff:';
 
+function parseRedisJson(raw) {
+  if (raw == null) return null;
+  if (typeof raw === 'object' && raw !== null) return raw;
+  if (typeof raw !== 'string') return null;
+  if (raw === '[object Object]') return null;
+  try {
+    return JSON.parse(raw);
+  } catch {
+    return null;
+  }
+}
+
 async function getProfileSnapshot(steamId) {
   if (!steamId) return null;
   // Prefer Redis when healthy
   if (redisClient && redisHealthy) {
     try {
       const raw = await redisClient.get(`${SNAPSHOT_KEY_PREFIX}${steamId}`);
-      if (raw) return JSON.parse(raw);
+      const parsed = parseRedisJson(raw);
+      if (parsed) return parsed;
     } catch (err) {
       console.warn('Redis getProfileSnapshot failed, falling back to in-memory cache:', err?.message);
       redisHealthy = false;
@@ -908,7 +926,8 @@ async function getProfileDiff(steamId) {
   if (redisClient && redisHealthy) {
     try {
       const raw = await redisClient.get(`${DIFF_KEY_PREFIX}${steamId}`);
-      if (raw) return JSON.parse(raw);
+      const parsed = parseRedisJson(raw);
+      if (parsed) return parsed;
     } catch (err) {
       console.warn('Redis getProfileDiff failed, falling back to in-memory cache:', err?.message);
       redisHealthy = false;
@@ -943,7 +962,8 @@ async function getDailyFortuneCache(steamId) {
   if (redisClient && redisHealthy) {
     try {
       const raw = await redisClient.get(`${DAILY_FORTUNE_KEY_PREFIX}${steamId}`);
-      if (raw) return JSON.parse(raw);
+      const parsed = parseRedisJson(raw);
+      if (parsed) return parsed;
     } catch (err) {
       console.warn('Redis getDailyFortuneCache failed:', err?.message);
     }
