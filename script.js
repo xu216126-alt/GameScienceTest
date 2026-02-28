@@ -369,38 +369,6 @@ const translations = {
 function buildFallbackScenarioData(lang) {
   const t = translations[lang] || translations["en-US"];
   return {
-    dailyRecommendations: {
-      title: t.dailyTitle || "Daily Recommendations",
-      description: t.dailyDesc || "Short sessions and high fun-per-minute titles.",
-      games: [
-        {
-          appId: 1145360,
-          name: "Hades",
-          mediaType: "image",
-          media:
-            "https://cdn.akamai.steamstatic.com/steam/apps/1145360/library_600x900.jpg",
-          mediaFallback:
-            "https://cdn.akamai.steamstatic.com/steam/apps/1145360/header.jpg",
-          positiveRate: "98%",
-          players: "36k online",
-          price: t.priceSample || "$24.99",
-          reason: t.dailyReason1 || "Good for frequent high-intensity sessions.",
-        },
-        {
-          appId: 646570,
-          name: "Slay the Spire",
-          mediaType: "image",
-          media:
-            "https://cdn.akamai.steamstatic.com/steam/apps/646570/library_600x900.jpg",
-          mediaFallback:
-            "https://cdn.akamai.steamstatic.com/steam/apps/646570/header.jpg",
-          positiveRate: "97%",
-          players: "11k online",
-          price: t.priceSample || "$24.99",
-          reason: t.dailyReason2 || "Excellent for tactical daily runs.",
-        },
-      ],
-    },
     trendingOnline: {
       title: t.trendingTitle || "Trending Online Games",
       description: t.trendingDesc || "Popular multiplayer experiences with active communities.",

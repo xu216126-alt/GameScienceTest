@@ -44,14 +44,6 @@ const MIME_TYPES = {
 };
 
 const FALLBACK_SCENARIOS = {
-  dailyRecommendations: {
-    title: 'Daily Recommendations',
-    description: 'Short sessions and high fun-per-minute titles for regular play.',
-    games: [
-      { appId: 1145360, reason: 'Fast runs and clear progression loops.', compatibility: 'playable', handheldCompatibility: 'playable' },
-      { appId: 646570, reason: 'Great for tactical short sessions.', compatibility: 'playable', handheldCompatibility: 'playable' },
-    ],
-  },
   trendingOnline: {
     title: 'Trending Online Games',
     description: 'Currently popular multiplayer games with active matchmaking.',
@@ -84,14 +76,6 @@ const FALLBACK_SCENARIOS = {
 };
 
 const FALLBACK_SCENARIOS_ZH = {
-  dailyRecommendations: {
-    title: '日常推荐',
-    description: '适合日常碎片时间的轻量佳作。',
-    games: [
-      { appId: 1145360, reason: '短局上手快，适合日常随时来一把。', compatibility: 'playable', handheldCompatibility: 'playable' },
-      { appId: 646570, reason: '节奏紧凑，碎片时间也能打出成就感。', compatibility: 'playable', handheldCompatibility: 'playable' },
-    ],
-  },
   trendingOnline: {
     title: '热门联机',
     description: '当前人气高、匹配活跃的联机作品。',
@@ -1651,14 +1635,12 @@ function sanitizeAiOutput(raw, fallbackSummary, lang = 'en-US') {
 
 function formatAnglePackText(anglePack) {
   if (!anglePack || typeof anglePack !== 'object') return '';
-  const daily = String(anglePack.daily || '').trim();
   const trending = String(anglePack.trending || '').trim();
   const taste = String(anglePack.taste || '').trim();
   const explore = String(anglePack.explore || '').trim();
   const id = String(anglePack.id || '').trim();
   return [
     id ? `AnglePack: ${id}` : '',
-    daily ? `dailyRecommendations angle: ${daily}` : '',
     trending ? `trendingOnline angle: ${trending}` : '',
     taste ? `tasteMatch angle: ${taste}` : '',
     explore ? `exploreNewAreas angle: ${explore}` : '',
@@ -1699,7 +1681,6 @@ function buildSystemPrompt({
       '- 将 refreshToken 视为“必须提高多样性”的信号。',
       analysisNonce ? `- 多样性随机因子：${analysisNonce}。用于避免重复推荐。` : '',
       '- 场景目标：',
-      '- dailyRecommendations：短时可玩、上手快、复玩价值高。',
       '- trendingOnline：强调当前活跃玩家多的多人游戏。',
       '- tasteMatch：与玩家最常玩游戏和核心偏好高度相似。',
       '- exploreNewAreas：来自玩家历史中相对少见类型的高质量作品。',
@@ -1721,7 +1702,6 @@ function buildSystemPrompt({
     '- Treat refreshToken as a signal to diversify the recommendation set.',
     analysisNonce ? `- Analysis nonce for diversity: ${analysisNonce}. Use it to avoid repeating prior lineups.` : '',
     '- Scenario-specific goals:',
-    '- dailyRecommendations: prioritize short-session games, quick onboarding, high replayability.',
     '- trendingOnline: prioritize active multiplayer titles with strong current player activity.',
     '- tasteMatch: prioritize strong similarity to the player top/recent games and core preferences.',
     '- exploreNewAreas: prioritize high-quality games from underrepresented genres in the player history.',
@@ -1745,7 +1725,6 @@ const SYSTEM_PROMPT_EN = [
   '  "playstyleTags": ["tag1", "tag2", "tag3"],',
   '  "gamingPersona": {"code": "ABCD", "name": "Persona Name", "review": "around 100 words, witty and insightful", "attributes": {"action": 0-100, "strategy": 0-100, "exploration": 0-100, "social": 0-100, "immersion": 0-100}, "traits": ["trait1", "trait2", "trait3"]},',
   '  "scenarios": {',
-  '    "dailyRecommendations": {"title": "...", "description": "...", "games": [{"appId": 10, "reason": "...", "compatibility": "smooth|playable|unplayable", "handheldCompatibility": "verified|playable|unsupported|unknown", "destiny_link": "...", "destiny_type": "creative_lineage|philosophical_echoes|hardware_atmospheric_synergy", "destiny_score": 0}]},',
   '    "trendingOnline": {"title": "...", "description": "...", "games": [{"appId": 570, "reason": "...", "compatibility": "smooth|playable|unplayable", "handheldCompatibility": "verified|playable|unsupported|unknown", "destiny_link": "...", "destiny_type": "creative_lineage|philosophical_echoes|hardware_atmospheric_synergy", "destiny_score": 0}]},',
   '    "tasteMatch": {"title": "...", "description": "...", "games": [{"appId": 730, "reason": "...", "compatibility": "smooth|playable|unplayable", "handheldCompatibility": "verified|playable|unsupported|unknown", "destiny_link": "...", "destiny_type": "creative_lineage|philosophical_echoes|hardware_atmospheric_synergy", "destiny_score": 0}]},',
   '    "exploreNewAreas": {"title": "...", "description": "...", "games": [{"appId": 620, "reason": "...", "compatibility": "smooth|playable|unplayable", "handheldCompatibility": "verified|playable|unsupported|unknown", "destiny_link": "...", "destiny_type": "creative_lineage|philosophical_echoes|hardware_atmospheric_synergy", "destiny_score": 0}]},',
@@ -1753,7 +1732,7 @@ const SYSTEM_PROMPT_EN = [
   '  }',
   '}',
   'Requirements:',
-  '- You MUST provide exactly 5 unique games for EACH of the 4 scenarios: dailyRecommendations, trendingOnline, tasteMatch, exploreNewAreas. Do not skip any scenario. (Fewer games per request reduces timeout risk.)',
+  '- You MUST provide exactly 5 unique games for EACH of the 3 scenarios: trendingOnline, tasteMatch, exploreNewAreas. Do not skip any scenario. (Fewer games per request reduces timeout risk.)',
   '- Generate a 4-letter gaming persona code (A-Z letters only), a short persona name, and an about-100-word witty Personality Review. Also provide "attributes" (scores 0-100 for action, strategy, exploration, social, immersion) and "traits" (exactly 3 short labels, e.g. "Hardcore", "Solo Runner", "Completionist").',
   '- Include valid Steam appId for each game.',
   '- Do not recommend any appId present in excludedOwnedAppIds.',
@@ -1780,7 +1759,7 @@ const SYSTEM_PROMPT_EN = [
 
 const SYSTEM_PROMPT_ZH = `你是一位毒舌又专业的 Steam 游戏资深鉴赏家。你必须完全使用简体中文思考和回复。
 必须输出原始 JSON，禁止任何 Markdown（例如 \`\`\`json 或 # 标题）。
-你的任务是根据用户的游戏库推荐 4 个场景的游戏，每个场景恰好 5 款（数量少一些可降低超时）。
+你的任务是根据用户的游戏库推荐 3 个场景的游戏，每个场景恰好 5 款（数量少一些可降低超时）。每日推荐已由赛博塔罗承担，此处不再包含。
 严禁输出任何英文推荐理由；summary、title、description、reason、destiny_link 必须全部为简体中文。
 summary 必须是「一段完整的命运洞察」（150～250 字），不能只写一句。需包含：若有近期活动则先写一句个性化问候并点名游戏或类型；接着概括该玩家的游玩风格与核心偏好；最后说明本页推荐的整体导向与为何契合其口味。务必具体、有信息量。
 在“命运关联度”字段中，请用深奥但幽默的中式占星风格解释为什么这款游戏是玩家的宿命。
@@ -1792,7 +1771,6 @@ summary 必须是「一段完整的命运洞察」（150～250 字），不能�
   "playstyleTags": ["tag1", "tag2", "tag3"],
   "gamingPersona": {"code": "ABCD", "name": "人格名称", "review": "人格描述（约100字中文）", "attributes": {"action": 0-100, "strategy": 0-100, "exploration": 0-100, "social": 0-100, "immersion": 0-100}, "traits": ["性格标签1", "性格标签2", "性格标签3"]},
   "scenarios": {
-    "dailyRecommendations": {"title": "...", "description": "...", "games": [{"appId": 10, "reason": "...", "compatibility": "smooth|playable|unplayable", "handheldCompatibility": "verified|playable|unsupported|unknown", "destiny_link": "...", "destiny_type": "creative_lineage|philosophical_echoes|hardware_atmospheric_synergy", "destiny_score": 0}]},
     "trendingOnline": {"title": "...", "description": "...", "games": [{"appId": 570, "reason": "...", "compatibility": "smooth|playable|unplayable", "handheldCompatibility": "verified|playable|unsupported|unknown", "destiny_link": "...", "destiny_type": "creative_lineage|philosophical_echoes|hardware_atmospheric_synergy", "destiny_score": 0}]},
     "tasteMatch": {"title": "...", "description": "...", "games": [{"appId": 730, "reason": "...", "compatibility": "smooth|playable|unplayable", "handheldCompatibility": "verified|playable|unsupported|unknown", "destiny_link": "...", "destiny_type": "creative_lineage|philosophical_echoes|hardware_atmospheric_synergy", "destiny_score": 0}]},
     "exploreNewAreas": {"title": "...", "description": "...", "games": [{"appId": 620, "reason": "...", "compatibility": "smooth|playable|unplayable", "handheldCompatibility": "verified|playable|unsupported|unknown", "destiny_link": "...", "destiny_type": "creative_lineage|philosophical_echoes|hardware_atmospheric_synergy", "destiny_score": 0}]},
@@ -2225,7 +2203,7 @@ function enrichDestinySignals(scenarios, profile, selectedMode, lang = 'en-US') 
 }
 
 function ensureScenarioMinimums(scenarios, forbiddenAppIds, lang = 'en-US') {
-  const requiredKeys = ['dailyRecommendations', 'trendingOnline', 'tasteMatch', 'exploreNewAreas'];
+  const requiredKeys = ['trendingOnline', 'tasteMatch', 'exploreNewAreas'];
   const forbidden = new Set((forbiddenAppIds || []).map((id) => Number(id)).filter((id) => Number.isInteger(id) && id > 0));
   const used = new Set();
   const fallbackScenarios = getFallbackScenariosForLang(lang);
@@ -2857,8 +2835,8 @@ const server = http.createServer(async (req, res) => {
           selectedMode
         );
         if (fallbackIds.length > 0) {
-          const laneKeys = ['dailyRecommendations', 'trendingOnline', 'tasteMatch', 'exploreNewAreas'];
-          const perLane = [8, 8, 8, 8];
+          const laneKeys = ['trendingOnline', 'tasteMatch', 'exploreNewAreas'];
+          const perLane = [8, 8, 8];
           let idx = 0;
           for (let i = 0; i < laneKeys.length && idx < fallbackIds.length; i++) {
             const n = Math.min(perLane[i], fallbackIds.length - idx);
@@ -2926,6 +2904,10 @@ const server = http.createServer(async (req, res) => {
       const finalPersona = isRefresh && personaOverride?.name ? personaOverride : aiOutput?.gamingPersona;
       const personaName = finalPersona?.name || 'Adaptive Strategist';
       const framedScenarios = frameScenariosByPersona(destinyEnhancedScenarios, personaName, lang);
+      // 每日推荐已由赛博塔罗承担，从推荐列表响应中移除 dailyRecommendations
+      const scenariosWithoutDaily = framedScenarios
+        ? Object.fromEntries(Object.entries(framedScenarios).filter(([k]) => k !== 'dailyRecommendations'))
+        : framedScenarios;
 
       // Session blacklist update: add all newly surfaced appIds so refresh avoids them.
       const newlyRecommendedIds = [];
@@ -2943,7 +2925,7 @@ const server = http.createServer(async (req, res) => {
         summary: aiOutput.summary,
         playstyleTags: aiOutput.playstyleTags,
         gamingPersona: finalPersona,
-        scenarios: framedScenarios,
+        scenarios: scenariosWithoutDaily,
         usedFallback,
         aiProvider,
         aiError: aiError || undefined,
