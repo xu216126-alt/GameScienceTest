@@ -53,7 +53,7 @@ The project is in a **working but network-sensitive** state with a multi-step UI
 
 ### 2.5 Recommendations & Game Cards
 - Scenario lanes with **horizontal scroll** (one row per scenario; overflow-x scroll).
-- **Per-scenario count**: 5–8 games per lane (min 5, max 8); backend `ensureScenarioMinimums` / `dedupeAndDiversifyScenarioGames` / `keepNonOwnedScenarioGames` / `sanitizeAiOutput` all respect this; backlog lane up to 6.
+- **Per-scenario count**: 3–5 games per lane (min 3, max 5); backend `ensureScenarioMinimums` / `dedupeAndDiversifyScenarioGames` / `keepNonOwnedScenarioGames` / `sanitizeAiOutput` all respect this; backlog lane up to 6.
 - Card design:
   - Fixed-size poster tiles (260px width, scroll-snap).
   - Slide-up info panel on hover.
@@ -65,7 +65,8 @@ The project is in a **working but network-sensitive** state with a multi-step UI
 - Refresh button:
   - Uses higher AI temperature and random prompt flavors.
   - Cycles scenario angles to increase variety.
-- **刷新缓存机制**：首次分析或每次刷新成功后，后台静默预取一组「下一轮刷新」结果写入 `refreshCache`；用户点刷新时若有缓存则**先展示缓存**再背后请求并更新缓存，无缓存则走原逻辑（等待接口后同样触发后台预取）。登出或切换 Steam 账号时清空缓存。见 §2.26。
+- **刷新缓存机制**：首次分析或每次刷新成功后，后台静默预取一组「下一轮刷新」结果写入 `refreshCache`；用户点刷新时**仅当缓存通过校验**（每场景至少 3 款、与当前展示重叠 ≤40%）才先展示缓存并背后再请求，否则走正常请求；预取结果也仅在通过同样校验时才写入缓存，避免「同一批游戏换场景」的观感。登出或切换 Steam 账号时清空缓存。见 §2.26。
+- **会话黑名单与跨场景去重**：后端将本次返回的全部推荐 appId 写入会话黑名单（Redis/内存），刷新与预取请求均携带前端 `excludedAppIds` 并与服务端黑名单合并，严禁再次推荐；响应前对场景做 `dedupeScenariosGlobally`，保证同一款游戏只出现在一个场景中，避免「同一游戏在不同场景间来回出现」。
 
 ### 2.6 Localization (Chinese-only)
 - **Language toggle removed.** All UI and visible content are **Chinese only** (`zh-CN`). Frontend uses `currentLang = "zh-CN"` and `t()` reads only from `translations["zh-CN"]`.

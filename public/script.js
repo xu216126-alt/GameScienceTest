@@ -974,7 +974,7 @@ function startBackgroundRefreshPrefetch() {
     }
   )
     .then((data) => {
-      if (currentSteamId && data && data.scenarios) {
+      if (currentSteamId && data && data.scenarios && isRefreshCacheUsable(data)) {
         refreshCache = { data, order };
       }
     })
@@ -1329,6 +1329,31 @@ function collectScenarioAppIds(scenarios) {
     });
   });
   return ids;
+}
+
+/** 非回坑场景的 key，用于校验缓存 */
+const NON_BACKLOG_SCENARIO_KEYS = ["trendingOnline", "tasteMatch", "exploreNewAreas"];
+const MIN_GAMES_PER_LANE = 3;
+const CACHE_OVERLAP_MAX_RATIO = 0.4; // 缓存与当前展示重叠超过 40% 则视为无效，不走缓存
+
+/** 校验缓存是否可用：每场景至少 MIN_GAMES_PER_LANE 款，且与当前展示重叠不超过 CACHE_OVERLAP_MAX_RATIO */
+function isRefreshCacheUsable(cachedData) {
+  if (!cachedData || !cachedData.scenarios) return false;
+  const scenarios = cachedData.scenarios;
+  for (const key of NON_BACKLOG_SCENARIO_KEYS) {
+    const games = scenarios[key]?.games || [];
+    if (games.length < MIN_GAMES_PER_LANE) return false;
+  }
+  const cachedIds = new Set(collectScenarioAppIds(scenarios));
+  if (cachedIds.size === 0) return false;
+  const currentIds = new Set(collectScenarioAppIds(currentScenarioData));
+  if (currentIds.size === 0) return true;
+  let overlap = 0;
+  currentIds.forEach((id) => {
+    if (cachedIds.has(id)) overlap += 1;
+  });
+  if (overlap / cachedIds.size > CACHE_OVERLAP_MAX_RATIO) return false;
+  return true;
 }
 
 function openModal() {
@@ -1727,8 +1752,8 @@ async function handleRefreshRecommendations() {
     return;
   }
 
-  // 有缓存：先展示缓存，再背后请求并写入新缓存
-  if (refreshCache) {
+  // 有缓存且校验通过（每场景至少 3 款、与当前展示重叠不高）才用缓存，否则走正常请求
+  if (refreshCache && isRefreshCacheUsable(refreshCache.data)) {
     const { data, order } = refreshCache;
     refreshCache = null;
     refreshCount += 1;
@@ -1738,6 +1763,9 @@ async function handleRefreshRecommendations() {
     renderRecommendations(currentScenarioData, currentScenarioOrder);
     startBackgroundRefreshPrefetch();
     return;
+  }
+  if (refreshCache) {
+    refreshCache = null;
   }
 
   setStatus(t("refreshing"), "#f5ae2b");

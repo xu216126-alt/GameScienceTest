@@ -1740,7 +1740,7 @@ const SYSTEM_PROMPT_EN = [
   '- backlogReviver must only recommend games from dormantOwnedGames/ownedGamesBrief (already in user library).',
   '- backlogReviver reasons must explain why now is a good time to return to that old game.',
   '- Prefer avoiding appIds in recentRecommendedAppIds to increase variation between refreshes.',
-  '- Avoid repeating the same appId across scenarios where possible.',
+  '- Each game (appId) must appear in at most ONE scenario. Never list the same appId under multiple scenarios.',
   '- The summary MUST be a full paragraph (150–250 words), not a single sentence. Include: (1) a personalized greeting when activityDiff is present, (2) a brief overview of the player\'s play style and top preferences, (3) why the recommendations on this page fit them. Be specific and substantive.',
   '- For every game, you MUST use at least two concrete tags (e.g., Souls-like, Indie, Open World) to justify the recommendation. Never use generic placeholders.',
   '- Use top50GamesWithCategories as primary evidence for persona generation and taste signals.',
@@ -1778,7 +1778,7 @@ summary 必须是「一段完整的命运洞察」（150～250 字），不能�
   }
 }
 gamingPersona 必须包含 attributes（五维 0-100：action 操作、strategy 策略、exploration 探索、social 社交、immersion 沉浸）和 traits（恰好 3 个性格标签，如「硬核玩家」「独行侠」「全成就党」）。
-请求中的 excludedSessionAppIds 为本次会话（含刷新）已推荐过的游戏 ID，严禁再次推荐其中任何一款。此外，在给出每款推荐游戏的 reason 或 destiny_link 时，必须引用该游戏至少两个具体的标签或类型描述（例如：类魂、独立、开放世界），并说明这些标签为什么契合当前场景；禁止使用空泛占位表述，禁止只写“很适合你”而不提任何真实标签。`;
+请求中的 excludedSessionAppIds 为本次会话（含刷新）已推荐过的游戏 ID，严禁再次推荐其中任何一款。同一款游戏的 appId 只能出现在一个场景中，禁止把同一款游戏列在多个场景下。此外，在给出每款推荐游戏的 reason 或 destiny_link 时，必须引用该游戏至少两个具体的标签或类型描述（例如：类魂、独立、开放世界），并说明这些标签为什么契合当前场景；禁止使用空泛占位表述，禁止只写“很适合你”而不提任何真实标签。`;
 const TOP_CONTEXT_LIMIT = 40;
 
 const PROVIDER_CIRCUIT_OPEN_MS = 60 * 1000;
@@ -2076,6 +2076,30 @@ function dedupeAndDiversifyScenarioGames(scenarios, forbiddenAppIds, lang = 'en-
   }
 
   return result;
+}
+
+/** 跨场景去重：同一 appId 只保留在第一个出现的场景中，避免同一游戏在不同场景间重复出现 */
+function dedupeScenariosGlobally(scenarios, lang = 'en-US') {
+  if (!scenarios || typeof scenarios !== 'object') return scenarios;
+  const keys = Object.keys(getFallbackScenariosForLang(lang)).filter((k) => k !== 'dailyRecommendations');
+  const usedAppIds = new Set();
+  const out = {};
+  for (const key of keys) {
+    const lane = scenarios[key];
+    if (!lane) {
+      out[key] = lane;
+      continue;
+    }
+    const games = (lane.games || []).filter((g) => {
+      const appId = Number(g?.appId);
+      if (!Number.isInteger(appId) || appId <= 0) return false;
+      if (usedAppIds.has(appId)) return false;
+      usedAppIds.add(appId);
+      return true;
+    });
+    out[key] = { ...lane, games };
+  }
+  return out;
 }
 
 function frameScenariosByPersona(scenarios, personaName, lang = 'en-US') {
@@ -2903,20 +2927,23 @@ const server = http.createServer(async (req, res) => {
       const personaName = finalPersona?.name || 'Adaptive Strategist';
       const framedScenarios = frameScenariosByPersona(destinyEnhancedScenarios, personaName, lang);
       // 每日推荐已由赛博塔罗承担，从推荐列表响应中移除 dailyRecommendations
-      const scenariosWithoutDaily = framedScenarios
+      let scenariosWithoutDaily = framedScenarios
         ? Object.fromEntries(Object.entries(framedScenarios).filter(([k]) => k !== 'dailyRecommendations'))
         : framedScenarios;
+      // 跨场景去重：同一 appId 只保留在第一个出现的场景中，避免「同一游戏在不同场景间来回出现」
+      scenariosWithoutDaily = dedupeScenariosGlobally(scenariosWithoutDaily, lang);
 
-      // Session blacklist update: add all newly surfaced appIds so refresh avoids them.
+      // Session blacklist update: add all newly surfaced appIds (from final response) so refresh avoids them.
       const newlyRecommendedIds = [];
-      Object.values(framedScenarios || {}).forEach((lane) => {
+      Object.values(scenariosWithoutDaily || {}).forEach((lane) => {
         (lane?.games || []).forEach((g) => {
           const id = Number(g?.appId);
           if (Number.isInteger(id) && id > 0) newlyRecommendedIds.push(id);
         });
       });
-      if (newlyRecommendedIds.length) {
-        await addToSessionBlacklist(steamId, newlyRecommendedIds);
+      const uniqueNewlyRecommended = [...new Set(newlyRecommendedIds)];
+      if (uniqueNewlyRecommended.length) {
+        await addToSessionBlacklist(steamId, uniqueNewlyRecommended);
       }
 
       sendJson(res, 200, {
