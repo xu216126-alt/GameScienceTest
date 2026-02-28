@@ -1,7 +1,7 @@
 # SteamSense AI - Progress Handoff (2026-02-28)
 
 ## 1. Current Status
-The project is in a **working but network-sensitive** state with a multi-step UI flow. The UI is **Chinese-only** (no language toggle). AI prompts and API continue to support `lang`; frontend always sends `zh-CN`.
+The project is in a **working but network-sensitive** state with a multi-step UI flow. The UI is **Chinese-only** (no language toggle). AI prompts and API continue to support `lang`; frontend always sends `zh-CN`. **Vercel 部署**：静态资源已改为通过 `public/` 目录由 Vercel 静态构建提供，首页与静态文件不再经 serverless 函数，避免出现 `{"error":"Not found"}`；推送 Git 后自动部署。
 
 ## 2. Implemented Features
 
@@ -187,9 +187,10 @@ The project is in a **working but network-sensitive** state with a multi-step UI
 - **弹窗**: 使用 `<dialog id="how-it-works-modal">`，包含整页架构与功能说明：整体流程（三步）、命运洞察（个人信息/游戏人格/状态与刷新）、游戏场景与推荐、赛博塔罗今日运势、技术要点（Steam/Redis 差分、AI 兜底、会话去重等）。支持关闭按钮、点击遮罩关闭、Esc 关闭。
 
 ## 3. Key Files
-- Frontend: `index.html`, `styles.css`, `script.js`
+- Frontend (开发): `index.html`, `styles.css`, `script.js`（根目录）
+- Frontend (Vercel 静态): `public/index.html`, `public/styles.css`, `public/script.js`, `public/images/`
 - Backend: `server.js`
-- Config: `.env.example`, `playwright.config.js`
+- Config: `vercel.json`, `.env.example`, `playwright.config.js`
 - Data: `fallback_games.json` (optional seed for pool)
 - E2E: `e2e/flow.spec.js`
 
@@ -199,11 +200,15 @@ The project is in a **working but network-sensitive** state with a multi-step UI
 - Port source: `PORT` in `.env` (default `3000`)
 
 ## 4.1 Vercel 部署
-- **vercel.json**：仅 build `server.js`（@vercel/node）；所有请求（/api、/auth、静态）均路由到 `server.js`，由同一 handler 处理。
-- **静态资源**：`serveStatic` 从 `ROOT`（`__dirname`）读取，故 `index.html`、`styles.css`、`script.js`、`images/` 等需与 `server.js` 同目录部署，不要放入 `.vercelignore`。
+- **vercel.json**：
+  - **builds**：`server.js`（@vercel/node）处理 API；`public/**`（@vercel/static）作为静态资源构建。
+  - **routes**：`/api/(.*)`、`/auth/(.*)` → `server.js`；`/` → `/index.html`；`/(.*)` → `/$1`（由静态构建提供）。
+- **静态资源**：前端静态文件放在 **`public/`** 目录（`public/index.html`、`public/styles.css`、`public/script.js`、`public/images/` 等）。Vercel 的 serverless 函数不会打包这些文件，若全部请求都走 `server.js` 会因读不到文件而返回 `{"error":"Not found"}`；因此改为由静态构建直接提供首页和静态资源，仅接口走 `server.js`。
+- **维护**：根目录的 `index.html`、`styles.css`、`script.js` 为开发源文件；部署时需与 `public/` 内内容保持一致（修改后同步到 `public/` 再提交推送）。
 - **Cron**：`GET /api/cron/refresh-pool` 由 Vercel Cron 每 3 天触发（`0 0 */3 * *`）；无需 node-cron。
 - **环境变量**：在 Vercel 控制台配置 `STEAM_API_KEY`、AI 密钥、`UPSTASH_REDIS_REST_URL` / `UPSTASH_REDIS_REST_TOKEN`（或 `REDIS_URL`）等。
 - **导出**：`module.exports = handler` 供 Vercel 调用；仅当 `require.main === module && NODE_ENV !== 'production'` 时执行 `server.listen`。
+- **自动部署**：推送至 Git 仓库（如 `main`）后，Vercel 会自动检测并部署。
 
 ## 5. Environment Variables
 
@@ -287,4 +292,5 @@ The project is in a **working but network-sensitive** state with a multi-step UI
 - [ ] 「分析完成」状态在推荐列表上方、刷新按钮左侧；点击「碎片时间」或「沉浸时光」会像点击「刷新推荐」一样重新拉取推荐。
 - [ ] 游戏人格面板展示五维属性条、3 个性格标签、底部 ANALYSIS_LOG_V2.0 / SYNC 装饰文案。
 - [ ] 右上角「了解原理」点击后弹出介绍弹窗，含架构与功能说明；可关闭/ Esc / 点击遮罩关闭。
+- [ ] Vercel 部署：静态由 `public/` + `@vercel/static` 提供，`/` 与静态资源走静态构建，`/api`、`/auth` 走 `server.js`；推送 Git 后自动部署。
 - [ ] `npm run test:e2e` passes (Playwright: auto-hydrate, loader buffer, scenario chip fade).

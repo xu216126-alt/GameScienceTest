@@ -2536,9 +2536,13 @@ async function enrichScenariosWithStoreData(scenarios, forbiddenAppIds = [], lan
 
 function serveStatic(res, pathname) {
   const safePath = path.normalize(pathname).replace(/^\.\.(\/|\\|$)/, '');
-  let filePath = path.join(ROOT, safePath === '/' ? 'index.html' : safePath);
+  // 优先从 public 目录提供静态文件（Vercel 部署时 public 通过 includeFiles 打包进函数）
+  const publicDir = path.join(ROOT, 'public');
+  const staticRoot = (fs.existsSync(publicDir) && fs.statSync(publicDir).isDirectory()) ? publicDir : ROOT;
+  let filePath = path.join(staticRoot, safePath === '/' ? 'index.html' : safePath);
 
-  if (!filePath.startsWith(ROOT)) return sendJson(res, 403, { error: 'Forbidden' });
+  const realPath = path.resolve(filePath);
+  if (!realPath.startsWith(path.resolve(staticRoot))) return sendJson(res, 403, { error: 'Forbidden' });
   if (fs.existsSync(filePath) && fs.statSync(filePath).isDirectory()) {
     filePath = path.join(filePath, 'index.html');
   }
