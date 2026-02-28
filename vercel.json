@@ -1,18 +1,15 @@
 {
   "version": 2,
   "builds": [
+    { "src": "public/**", "use": "@vercel/static" },
     { "src": "server.js", "use": "@vercel/node" }
   ],
   "routes": [
     { "src": "/api/(.*)", "dest": "/server.js" },
     { "src": "/auth/(.*)", "dest": "/server.js" },
-    { "src": "/(.*)", "dest": "/server.js" }
+    { "src": "/", "dest": "/index.html" },
+    { "src": "/(.*)", "dest": "/$1" }
   ],
-  "functions": {
-    "server.js": {
-      "includeFiles": "public/**"
-    }
-  },
   "crons": [
     { "path": "/api/cron/refresh-pool", "schedule": "0 0 */3 * *" }
   ]
