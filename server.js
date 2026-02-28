@@ -3010,9 +3010,10 @@ const server = http.createServer(async (req, res) => {
       // 跨场景去重：同一 appId 只保留在第一个出现的场景中，避免「同一游戏在不同场景间来回出现」
       scenariosWithoutDaily = dedupeScenariosGlobally(scenariosWithoutDaily, lang);
 
-      // 若三个非回坑场景全部为空，用 Redis 兜底池强制填充，确保绝不返回全 0
+      // 若三个非回坑场景全部为空，用 Redis 兜底池强制填充，确保绝不返回全 0；填充后拉取商店详情以展示名称/封面等
       const nonBacklogKeys = ['trendingOnline', 'tasteMatch', 'exploreNewAreas'];
       const totalNonBacklog = nonBacklogKeys.reduce((sum, k) => sum + (scenariosWithoutDaily?.[k]?.games?.length || 0), 0);
+      let rescueFilled = null;
       if (totalNonBacklog === 0 && redisClient && redisHealthy) {
         const rescueIds = await getFallbackPoolGamesFromRedis(
           profile.ownedAppIds,
@@ -3027,12 +3028,12 @@ const server = http.createServer(async (req, res) => {
           const fallbackScenarios = getFallbackScenariosForLang(lang);
           const perLane = [5, 5, 5];
           let idx = 0;
-          const filled = { ...scenariosWithoutDaily };
+          rescueFilled = { ...scenariosWithoutDaily };
           for (const key of nonBacklogKeys) {
             const n = Math.min(perLane[nonBacklogKeys.indexOf(key)], Math.max(0, rescueIds.length - idx));
             if (n > 0) {
               const slice = rescueIds.slice(idx, idx + n);
-              filled[key] = {
+              rescueFilled[key] = {
                 title: fallbackScenarios[key]?.title ?? key,
                 description: fallbackScenarios[key]?.description ?? '',
                 games: slice.map((appId) => ({
@@ -3057,22 +3058,21 @@ const server = http.createServer(async (req, res) => {
               idx += n;
             }
           }
-          scenariosWithoutDaily = filled;
-        } else if (rescueIds.length === 0) {
+        } else {
           const hardcodedIds = [730, 570, 620, 1145360, 548430, 588650, 632470, 255710, 553850].filter(
             (id) => !profile.ownedAppIds.includes(id) && !mergedExcludedSessionAppIds.includes(id)
           );
           if (hardcodedIds.length > 0) {
             console.log('[ai-analysis] Redis rescue empty, using hardcoded fallback:', hardcodedIds.length);
             const fallbackScenarios = getFallbackScenariosForLang(lang);
-            const filled = { ...scenariosWithoutDaily };
+            rescueFilled = { ...scenariosWithoutDaily };
             const perLane = [3, 3, 3];
             let idx = 0;
             for (const key of nonBacklogKeys) {
               const n = Math.min(perLane[nonBacklogKeys.indexOf(key)], Math.max(0, hardcodedIds.length - idx));
               if (n > 0) {
                 const slice = hardcodedIds.slice(idx, idx + n);
-                filled[key] = {
+                rescueFilled[key] = {
                   title: fallbackScenarios[key]?.title ?? key,
                   description: fallbackScenarios[key]?.description ?? '',
                   games: slice.map((appId) => ({
@@ -3097,9 +3097,15 @@ const server = http.createServer(async (req, res) => {
                 idx += n;
               }
             }
-            scenariosWithoutDaily = filled;
           }
         }
+      }
+      if (rescueFilled) {
+        scenariosWithoutDaily = await enrichScenariosWithStoreData(
+          rescueFilled,
+          [...recentRecommendedAppIds, ...mergedExcludedSessionAppIds],
+          lang
+        );
       }
 
       // Session blacklist update: add all newly surfaced appIds (from final response) so refresh avoids them.
