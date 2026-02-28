@@ -117,6 +117,7 @@ const REDIS_URL = process.env.REDIS_URL || '';
 const UPSTASH_REDIS_REST_URL = process.env.UPSTASH_REDIS_REST_URL || '';
 const UPSTASH_REDIS_REST_TOKEN = process.env.UPSTASH_REDIS_REST_TOKEN || '';
 const SESSION_BLACKLIST_TTL_SEC = Number(process.env.SESSION_BLACKLIST_TTL_SEC || 10 * 60);
+const SESSION_BLACKLIST_MAX_SIZE = Number(process.env.SESSION_BLACKLIST_MAX_SIZE || 50);
 const FALLBACK_POOL_KEY = 'steam_sense:fallback_pool';
 const FALLBACK_POOL_KEY_V2 = 'steam_sense:fallback_pool_v2';
 const POOL_CATEGORY_CASUAL = 'steam_sense:pool:casual';
@@ -1122,22 +1123,33 @@ async function addToSessionBlacklist(steamId, appIds) {
     .filter((id) => Number.isInteger(id) && id > 0);
   if (!ids.length) return;
 
+  const existing = await getSessionBlacklist(steamId);
+  const seen = new Set();
+  const merged = [];
+  for (const id of [...ids, ...existing]) {
+    if (!seen.has(id)) {
+      seen.add(id);
+      merged.push(id);
+    }
+  }
+  const trimmed = merged.slice(0, SESSION_BLACKLIST_MAX_SIZE);
+
   if (redisClient && redisHealthy) {
     const key = `${SESSION_BLACKLIST_KEY_PREFIX}${steamId}`;
     try {
-      const members = ids.map(String);
-      await redisClient.sAdd(key, ...members);
-      await redisClient.expire(key, SESSION_BLACKLIST_TTL_SEC);
+      await redisClient.del(key);
+      if (trimmed.length > 0) {
+        const members = trimmed.map(String);
+        await redisClient.sAdd(key, ...members);
+        await redisClient.expire(key, SESSION_BLACKLIST_TTL_SEC);
+      }
     } catch (err) {
       console.warn('Redis addToSessionBlacklist failed, falling back to in-memory cache:', err?.message);
       redisHealthy = false;
     }
   }
 
-  const existing = FALLBACK_SESSION_BLACKLIST.get(steamId);
-  const set = new Set(existing && Array.isArray(existing.ids) ? existing.ids : []);
-  ids.forEach((id) => set.add(id));
-  FALLBACK_SESSION_BLACKLIST.set(steamId, { timestamp: Date.now(), ids: Array.from(set) });
+  FALLBACK_SESSION_BLACKLIST.set(steamId, { timestamp: Date.now(), ids: trimmed });
 }
 
 function sendJson(res, statusCode, payload) {
