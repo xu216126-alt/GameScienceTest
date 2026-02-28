@@ -1113,6 +1113,8 @@ function createGameCard(game, revealIndex) {
   const card = document.createElement("article");
   card.className = "game-card";
   card.dataset.appId = String(game.appId);
+  const isPlaceholder = game.name === `App ${game.appId}`;
+  if (isPlaceholder) card.classList.add("game-card--placeholder");
 
   const mediaWrap = document.createElement("div");
   mediaWrap.className = "game-media-wrap";
@@ -1220,7 +1222,10 @@ function createGameCard(game, revealIndex) {
   detailsBtn.type = "button";
   detailsBtn.className = "ghost-btn card-btn";
   detailsBtn.textContent = t("viewDetails");
-  detailsBtn.addEventListener("click", () => openGameModal(game.appId, game.name, game.reason, game.destinyLink));
+  detailsBtn.addEventListener("click", () => {
+    const nameEl = card.querySelector(".card-info h4");
+    openGameModal(game.appId, nameEl ? nameEl.textContent : game.name, game.reason, game.destinyLink);
+  });
 
   const steamLink = document.createElement("a");
   steamLink.className = "steam-link";
@@ -1318,6 +1323,56 @@ function renderRecommendations(scenarios = currentScenarioData, forcedOrder = cu
     lane.appendChild(laneGrid);
     recommendationGrid.appendChild(lane);
   });
+
+  if (!isAnalyzing) scheduleEnrichPlaceholderCards();
+}
+
+const GAME_DETAILS_BATCH_MAX = 20;
+const ENRICH_RETRY_DELAYS_MS = [0, 3000, 8000];
+
+function scheduleEnrichPlaceholderCards() {
+  ENRICH_RETRY_DELAYS_MS.forEach((delayMs) => {
+    setTimeout(() => enrichPlaceholderCards(), delayMs);
+  });
+}
+
+async function enrichPlaceholderCards() {
+  const placeholders = document.querySelectorAll(".game-card--placeholder");
+  if (!placeholders.length) return;
+  const appIds = Array.from(placeholders)
+    .map((el) => el.dataset.appId)
+    .filter(Boolean)
+    .slice(0, GAME_DETAILS_BATCH_MAX);
+  if (!appIds.length) return;
+  try {
+    const res = await fetch(
+      `/api/game-details-batch?appIds=${appIds.join(",")}&lang=${encodeURIComponent(currentLang)}`
+    );
+    if (!res.ok) return;
+    const data = await res.json();
+    if (!data || typeof data !== "object") return;
+    Object.entries(data).forEach(([id, details]) => {
+      const card = document.querySelector(`.game-card[data-app-id="${id}"]`);
+      if (!card || !details.name) return;
+      const media = card.querySelector(".game-media");
+      const title = card.querySelector(".card-info h4");
+      const priceLine = card.querySelector(".card-price");
+      const metrics = card.querySelector(".game-metrics");
+      if (media) {
+        media.src = details.posterImage || details.headerImage || media.src;
+        media.alt = `${details.name} poster`;
+      }
+      if (title) title.textContent = details.name;
+      if (priceLine) priceLine.textContent = `${t("priceLabel")}: ${details.price || t("naLabel")}`;
+      if (metrics) {
+        const values = card.querySelectorAll(".game-metrics .metric-value");
+        if (values[0]) values[0].textContent = details.positiveRate || t("naLabel");
+        if (values[1]) values[1].textContent = details.currentPlayers || t("naLabel");
+        if (values[2]) values[2].textContent = details.price || t("naLabel");
+      }
+      card.classList.remove("game-card--placeholder");
+    });
+  } catch (_) {}
 }
 
 function collectScenarioAppIds(scenarios) {

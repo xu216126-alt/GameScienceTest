@@ -3213,6 +3213,28 @@ const server = http.createServer(async (req, res) => {
       return;
     }
 
+    if (pathname === '/api/game-details-batch' && req.method === 'GET') {
+      const appIdsParam = requestUrl.searchParams.get('appIds') || '';
+      const lang = normalizeLang(requestUrl.searchParams.get('lang') || 'en-US');
+      const appIds = appIdsParam
+        .split(',')
+        .map((s) => Number(s.trim()))
+        .filter((id) => Number.isInteger(id) && id > 0)
+        .slice(0, 20);
+      if (appIds.length === 0) return sendJson(res, 400, { error: 'Missing or invalid appIds (comma-separated, max 20).' });
+      const results = {};
+      await Promise.all(
+        appIds.map(async (appId) => {
+          try {
+            const d = await getGameDetails(appId, lang);
+            if (d && d.name && !/^App\s+\d+$/i.test(d.name)) results[String(appId)] = d;
+          } catch (_) {}
+        })
+      );
+      sendJson(res, 200, results);
+      return;
+    }
+
     if (pathname.startsWith('/api/game/') && req.method === 'GET') {
       const appId = pathname.replace('/api/game/', '').trim();
       const lang = normalizeLang(requestUrl.searchParams.get('lang') || 'en-US');
