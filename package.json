@@ -1,0 +1,8 @@
+{
+  "name": "steamsense-ai",
+  "version": "1.0.0",
+  "private": true,
+  "scripts": { "start": "node server.js", "test": "npx jest", "test:e2e": "npx playwright test" },
+  "dependencies": { "@upstash/redis": "^1.28.0", "node-cron": "^3.0.3", "redis": "^4.6.14" },
+  "devDependencies": { "jest": "^29.7.0", "@playwright/test": "^1.40.0" }
+}
