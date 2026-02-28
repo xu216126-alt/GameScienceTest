@@ -633,9 +633,9 @@ async function getFallbackPoolGamesFromRedis(
       if (str.startsWith('{')) {
         try {
           const o = JSON.parse(str);
-          const id = Number(o?.id ?? o?.appId);
+          const id = Number(o?.id ?? o?.appId ?? o?.Id ?? o?.ID);
           return Number.isInteger(id) && id > 0
-            ? { id, tags: Array.isArray(o.tags) ? o.tags : [], releaseDate: String(o.releaseDate || '') }
+            ? { id, tags: Array.isArray(o.tags) ? o.tags : [], releaseDate: String(o.releaseDate || o.发布日期 || '') }
             : null;
         } catch {
           const id = Number(str);
@@ -2620,6 +2620,17 @@ const server = http.createServer(async (req, res) => {
       const primaryState = providerState.primary;
       const secondaryState = providerState.deepseek;
 
+      let fallbackPoolV2Size = null;
+      let fallbackPoolSize = null;
+      if (redisClient && redisHealthy) {
+        try {
+          fallbackPoolV2Size = await redisClient.zCard(FALLBACK_POOL_KEY_V2).catch(() => null);
+          fallbackPoolSize = await redisClient.sCard(FALLBACK_POOL_KEY).catch(() => null);
+        } catch (_) {
+          // keep null
+        }
+      }
+
       const health = {
         ok: true,
         steam: {
@@ -2628,6 +2639,8 @@ const server = http.createServer(async (req, res) => {
         redis: {
           configured: redisConfigured,
           healthy: redisConfigured ? Boolean(redisClient && redisHealthy) : false,
+          fallbackPoolV2Size: fallbackPoolV2Size,
+          fallbackPoolSize: fallbackPoolSize,
         },
         aiProviders: {
           primary: {
