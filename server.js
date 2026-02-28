@@ -117,6 +117,10 @@ const REDIS_URL = process.env.REDIS_URL || '';
 const UPSTASH_REDIS_REST_URL = process.env.UPSTASH_REDIS_REST_URL || '';
 const UPSTASH_REDIS_REST_TOKEN = process.env.UPSTASH_REDIS_REST_TOKEN || '';
 const SESSION_BLACKLIST_TTL_SEC = Number(process.env.SESSION_BLACKLIST_TTL_SEC || 10 * 60);
+const FALLBACK_POOL_KEY = 'steam_sense:fallback_pool';
+const FALLBACK_POOL_KEY_V2 = 'steam_sense:fallback_pool_v2';
+const POOL_CATEGORY_CASUAL = 'steam_sense:pool:casual';
+const POOL_CATEGORY_HARDCORE = 'steam_sense:pool:hardcore';
 let redisClient = null;
 let redisHealthy = false;
 let redisReadyResolve = null;
@@ -227,11 +231,7 @@ if (UPSTASH_REDIS_REST_URL && UPSTASH_REDIS_REST_TOKEN) {
   }
 }
 
-const FALLBACK_POOL_KEY = 'steam_sense:fallback_pool';
-const FALLBACK_POOL_KEY_V2 = 'steam_sense:fallback_pool_v2';
 const FALLBACK_POOL_TOP_N_FOR_PICK = 100;
-const POOL_CATEGORY_CASUAL = 'steam_sense:pool:casual';
-const POOL_CATEGORY_HARDCORE = 'steam_sense:pool:hardcore';
 const STEAMSPY_TAGS_TOP_N = 5;
 const STEAMSPY_ENRICH_CONCURRENCY = 5;
 const STEAMSPY_ENRICH_BATCH_DELAY_MS = 200;
@@ -627,7 +627,17 @@ async function getFallbackPoolGamesFromRedis(
         rangeEnd = offset + windowSize - 1;
       }
       const raw = await redisClient.zRange(FALLBACK_POOL_KEY_V2, rangeStart, rangeEnd, { REV: true });
-      rawList = Array.isArray(raw) ? raw.map((v) => String(v)) : raw != null ? [String(raw)] : [];
+      if (Array.isArray(raw)) {
+        rawList = raw
+          .map((v) => {
+            if (v && typeof v === 'object' && v.member != null) return String(v.member);
+            if (typeof v === 'string' && (v.startsWith('{') || v.startsWith('['))) return v;
+            return null;
+          })
+          .filter(Boolean);
+      } else {
+        rawList = raw != null ? [String(raw)] : [];
+      }
     } else {
       const size = await redisClient.sCard(FALLBACK_POOL_KEY);
       if (size === 0) return [];
@@ -2999,6 +3009,98 @@ const server = http.createServer(async (req, res) => {
         : framedScenarios;
       // 跨场景去重：同一 appId 只保留在第一个出现的场景中，避免「同一游戏在不同场景间来回出现」
       scenariosWithoutDaily = dedupeScenariosGlobally(scenariosWithoutDaily, lang);
+
+      // 若三个非回坑场景全部为空，用 Redis 兜底池强制填充，确保绝不返回全 0
+      const nonBacklogKeys = ['trendingOnline', 'tasteMatch', 'exploreNewAreas'];
+      const totalNonBacklog = nonBacklogKeys.reduce((sum, k) => sum + (scenariosWithoutDaily?.[k]?.games?.length || 0), 0);
+      if (totalNonBacklog === 0 && redisClient && redisHealthy) {
+        const rescueIds = await getFallbackPoolGamesFromRedis(
+          profile.ownedAppIds,
+          mergedExcludedSessionAppIds,
+          15,
+          String(steamId),
+          [],
+          selectedMode
+        );
+        if (rescueIds.length > 0) {
+          console.log('[ai-analysis] all lanes empty, filling from Redis rescue pool:', rescueIds.length);
+          const fallbackScenarios = getFallbackScenariosForLang(lang);
+          const perLane = [5, 5, 5];
+          let idx = 0;
+          const filled = { ...scenariosWithoutDaily };
+          for (const key of nonBacklogKeys) {
+            const n = Math.min(perLane[nonBacklogKeys.indexOf(key)], Math.max(0, rescueIds.length - idx));
+            if (n > 0) {
+              const slice = rescueIds.slice(idx, idx + n);
+              filled[key] = {
+                title: fallbackScenarios[key]?.title ?? key,
+                description: fallbackScenarios[key]?.description ?? '',
+                games: slice.map((appId) => ({
+                  appId,
+                  name: `App ${appId}`,
+                  mediaType: 'image',
+                  media: `https://cdn.akamai.steamstatic.com/steam/apps/${appId}/library_600x900.jpg`,
+                  mediaFallback: `https://cdn.akamai.steamstatic.com/steam/apps/${appId}/header.jpg`,
+                  positiveRate: '',
+                  players: '',
+                  price: '',
+                  releaseDate: '',
+                  reason: buildMysticalFallbackReason(lang),
+                  compatibility: 'playable',
+                  handheldCompatibility: 'unknown',
+                  destinyLink: '',
+                  destinyType: 'philosophical_echoes',
+                  destinyScore: 78,
+                  fromLibrary: false,
+                })),
+              };
+              idx += n;
+            }
+          }
+          scenariosWithoutDaily = filled;
+        } else if (rescueIds.length === 0) {
+          const hardcodedIds = [730, 570, 620, 1145360, 548430, 588650, 632470, 255710, 553850].filter(
+            (id) => !profile.ownedAppIds.includes(id) && !mergedExcludedSessionAppIds.includes(id)
+          );
+          if (hardcodedIds.length > 0) {
+            console.log('[ai-analysis] Redis rescue empty, using hardcoded fallback:', hardcodedIds.length);
+            const fallbackScenarios = getFallbackScenariosForLang(lang);
+            const filled = { ...scenariosWithoutDaily };
+            const perLane = [3, 3, 3];
+            let idx = 0;
+            for (const key of nonBacklogKeys) {
+              const n = Math.min(perLane[nonBacklogKeys.indexOf(key)], Math.max(0, hardcodedIds.length - idx));
+              if (n > 0) {
+                const slice = hardcodedIds.slice(idx, idx + n);
+                filled[key] = {
+                  title: fallbackScenarios[key]?.title ?? key,
+                  description: fallbackScenarios[key]?.description ?? '',
+                  games: slice.map((appId) => ({
+                    appId,
+                    name: `App ${appId}`,
+                    mediaType: 'image',
+                    media: `https://cdn.akamai.steamstatic.com/steam/apps/${appId}/library_600x900.jpg`,
+                    mediaFallback: `https://cdn.akamai.steamstatic.com/steam/apps/${appId}/header.jpg`,
+                    positiveRate: '',
+                    players: '',
+                    price: '',
+                    releaseDate: '',
+                    reason: buildMysticalFallbackReason(lang),
+                    compatibility: 'playable',
+                    handheldCompatibility: 'unknown',
+                    destinyLink: '',
+                    destinyType: 'philosophical_echoes',
+                    destinyScore: 78,
+                    fromLibrary: false,
+                  })),
+                };
+                idx += n;
+              }
+            }
+            scenariosWithoutDaily = filled;
+          }
+        }
+      }
 
       // Session blacklist update: add all newly surfaced appIds (from final response) so refresh avoids them.
       const newlyRecommendedIds = [];
