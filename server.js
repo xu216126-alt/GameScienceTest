@@ -752,8 +752,10 @@ const DIVERSITY_APP_POOL = [
 ];
 
 const TRENDING_FALLBACK_POOL = [
-  730, 570, 271590, 1086940, 252490, 1172470, 271590, 1238810, 1817070, 1145360,
-  1091500, 413150, 1174180, 892970, 1245620, 550, 620, 440, 1593500, 242760,
+  730, 570, 271590, 1086940, 252490, 1172470, 1238810, 1817070, 1145360, 1091500,
+  413150, 1174180, 892970, 1245620, 550, 620, 440, 1593500, 242760, 548430, 588650,
+  632470, 255710, 553850, 2073850, 739630, 990080, 582010, 1716740, 275850, 367520,
+  782330, 236390, 1158310, 1129580, 945360, 2399830, 1174180, 1938090, 1627720,
 ];
 
 function buildScenarioSkeleton(lang = 'en-US') {
@@ -2509,30 +2511,51 @@ async function enrichScenariosWithStoreData(scenarios, forbiddenAppIds = [], lan
       const shouldSkipForbidden = key !== 'backlogReviver';
       if (!Number.isInteger(appId) || appId <= 0 || used.has(appId) || (shouldSkipForbidden && hardForbidden.has(appId))) continue;
       const details = prefetchedDetails.get(appId);
-      if (!details) continue;
-      used.add(details.appId);
-      const releaseDate = details.releaseDate || '';
-      const newRelease = isNewRelease(releaseDate);
-      const reason = newRelease ? buildNewReleaseReason(lang) : (g.reason || '');
-      games.push({
-        appId: details.appId,
-        name: details.name,
-        mediaType: 'image',
-        media: details.posterImage || details.headerImage,
-        mediaFallback: details.headerImage,
-        positiveRate: details.positiveRate,
-        players: details.currentPlayers,
-        price: details.price,
-        releaseDate,
-        isNewRelease: newRelease,
-        reason,
-        compatibility: g.compatibility || 'playable',
-        handheldCompatibility: g.handheldCompatibility || 'unknown',
-        destinyLink: g.destinyLink || '',
-        destinyType: g.destinyType || 'philosophical_echoes',
-        destinyScore: Number.isFinite(Number(g.destinyScore)) ? Math.max(0, Math.min(100, Math.round(Number(g.destinyScore)))) : 0,
-        fromLibrary: Boolean(g.fromLibrary),
-      });
+      used.add(appId);
+      if (details) {
+        const releaseDate = details.releaseDate || '';
+        const newRelease = isNewRelease(releaseDate);
+        const reason = newRelease ? buildNewReleaseReason(lang) : (g.reason || '');
+        games.push({
+          appId: details.appId,
+          name: details.name,
+          mediaType: 'image',
+          media: details.posterImage || details.headerImage,
+          mediaFallback: details.headerImage,
+          positiveRate: details.positiveRate,
+          players: details.currentPlayers,
+          price: details.price,
+          releaseDate,
+          isNewRelease: newRelease,
+          reason,
+          compatibility: g.compatibility || 'playable',
+          handheldCompatibility: g.handheldCompatibility || 'unknown',
+          destinyLink: g.destinyLink || '',
+          destinyType: g.destinyType || 'philosophical_echoes',
+          destinyScore: Number.isFinite(Number(g.destinyScore)) ? Math.max(0, Math.min(100, Math.round(Number(g.destinyScore)))) : 0,
+          fromLibrary: Boolean(g.fromLibrary),
+        });
+      } else {
+        games.push({
+          appId,
+          name: `App ${appId}`,
+          mediaType: 'image',
+          media: `https://cdn.akamai.steamstatic.com/steam/apps/${appId}/library_600x900.jpg`,
+          mediaFallback: `https://cdn.akamai.steamstatic.com/steam/apps/${appId}/header.jpg`,
+          positiveRate: '',
+          players: '',
+          price: '',
+          releaseDate: '',
+          isNewRelease: false,
+          reason: g.reason || (lang === 'zh-CN' ? '命运线与此作交汇，值得一试。' : 'A destiny link—worth a try.'),
+          compatibility: g.compatibility || 'playable',
+          handheldCompatibility: g.handheldCompatibility || 'unknown',
+          destinyLink: g.destinyLink || '',
+          destinyType: g.destinyType || 'philosophical_echoes',
+          destinyScore: Number.isFinite(Number(g.destinyScore)) ? Math.max(0, Math.min(100, Math.round(Number(g.destinyScore)))) : 0,
+          fromLibrary: Boolean(g.fromLibrary),
+        });
+      }
     }
 
     enriched[key] = {
