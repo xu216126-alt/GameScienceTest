@@ -1596,7 +1596,7 @@ function sanitizeAiOutput(raw, fallbackSummary, lang = 'en-US') {
             destinyScore: Number.isFinite(g.destinyScore) ? Math.max(0, Math.min(100, Math.round(g.destinyScore))) : 0,
           }))
           .filter((g) => Number.isInteger(g.appId) && g.appId > 0)
-          .slice(0, 8)
+          .slice(0, 5)
       : [];
 
     out.scenarios[key] = { title, description, games };
@@ -1732,7 +1732,7 @@ const SYSTEM_PROMPT_EN = [
   '  }',
   '}',
   'Requirements:',
-  '- You MUST provide exactly 5 unique games for EACH of the 3 scenarios: trendingOnline, tasteMatch, exploreNewAreas. Do not skip any scenario. (Fewer games per request reduces timeout risk.)',
+  '- You MUST provide between 3 and 5 unique games for EACH of the 3 scenarios: trendingOnline, tasteMatch, exploreNewAreas. Each scenario must have at least 3 games and at most 5. Do not skip any scenario.',
   '- Generate a 4-letter gaming persona code (A-Z letters only), a short persona name, and an about-100-word witty Personality Review. Also provide "attributes" (scores 0-100 for action, strategy, exploration, social, immersion) and "traits" (exactly 3 short labels, e.g. "Hardcore", "Solo Runner", "Completionist").',
   '- Include valid Steam appId for each game.',
   '- Do not recommend any appId present in excludedOwnedAppIds.',
@@ -1759,7 +1759,7 @@ const SYSTEM_PROMPT_EN = [
 
 const SYSTEM_PROMPT_ZH = `你是一位毒舌又专业的 Steam 游戏资深鉴赏家。你必须完全使用简体中文思考和回复。
 必须输出原始 JSON，禁止任何 Markdown（例如 \`\`\`json 或 # 标题）。
-你的任务是根据用户的游戏库推荐 3 个场景的游戏，每个场景恰好 5 款（数量少一些可降低超时）。每日推荐已由赛博塔罗承担，此处不再包含。
+你的任务是根据用户的游戏库推荐 3 个场景的游戏，每个场景至少 3 款、最多 5 款（必须保证每个场景不少于 3 款）。每日推荐已由赛博塔罗承担，此处不再包含。
 严禁输出任何英文推荐理由；summary、title、description、reason、destiny_link 必须全部为简体中文。
 summary 必须是「一段完整的命运洞察」（150～250 字），不能只写一句。需包含：若有近期活动则先写一句个性化问候并点名游戏或类型；接着概括该玩家的游玩风格与核心偏好；最后说明本页推荐的整体导向与为何契合其口味。务必具体、有信息量。
 在“命运关联度”字段中，请用深奥但幽默的中式占星风格解释为什么这款游戏是玩家的宿命。
@@ -2023,7 +2023,7 @@ function keepNonOwnedScenarioGames(scenarios, ownedAppIds, lang = 'en-US') {
     result[key] = {
       title: lane.title,
       description: lane.description,
-      games: filteredPrimary.slice(0, 8),
+      games: filteredPrimary.slice(0, 5),
     };
   }
 
@@ -2065,7 +2065,7 @@ function dedupeAndDiversifyScenarioGames(scenarios, forbiddenAppIds, lang = 'en-
       if (forbidden.has(appId) || globallyUsed.has(appId)) continue;
       selected.push(g);
       globallyUsed.add(appId);
-      if (selected.length >= 8) break;
+      if (selected.length >= 5) break;
     }
 
     result[key] = {
@@ -2228,8 +2228,8 @@ function ensureScenarioMinimums(scenarios, forbiddenAppIds, lang = 'en-US') {
           return true;
         })
       : [];
-    const minPerLane = 5;
-    const maxPerLane = 8;
+    const minPerLane = 3;
+    const maxPerLane = 5;
     for (const appId of TRENDING_FALLBACK_POOL) {
       if (games.length >= minPerLane) break;
       if (forbidden.has(appId) || used.has(appId)) continue;
@@ -2380,8 +2380,8 @@ async function repairEmptyNonBacklogLanes(scenarios, forbiddenAppIds, lang = 'en
       continue;
     }
     const games = [...(lane?.games || [])];
-    const minPerLane = 5;
-    const maxPerLane = 8;
+    const minPerLane = 3;
+    const maxPerLane = 5;
     while (games.length < minPerLane) {
       const candidate = await resolvePoolGame(new Set([...forbidden, ...used]), lang);
       if (!candidate) break;
@@ -2836,7 +2836,7 @@ const server = http.createServer(async (req, res) => {
         );
         if (fallbackIds.length > 0) {
           const laneKeys = ['trendingOnline', 'tasteMatch', 'exploreNewAreas'];
-          const perLane = [8, 8, 8];
+          const perLane = [5, 5, 5];
           let idx = 0;
           for (let i = 0; i < laneKeys.length && idx < fallbackIds.length; i++) {
             const n = Math.min(perLane[i], fallbackIds.length - idx);
@@ -2864,13 +2864,11 @@ const server = http.createServer(async (req, res) => {
         [...profile.ownedAppIds, ...recentRecommendedAppIds, ...mergedExcludedSessionAppIds],
         lang
       );
-      const repairedNonOwned = !usedFallback
-        ? ensureScenarioMinimums(
-            diversified,
-            [...profile.ownedAppIds, ...recentRecommendedAppIds, ...mergedExcludedSessionAppIds],
-            lang
-          )
-        : diversified;
+      const repairedNonOwned = ensureScenarioMinimums(
+        diversified,
+        [...profile.ownedAppIds, ...recentRecommendedAppIds, ...mergedExcludedSessionAppIds],
+        lang
+      );
       const forbiddenForBacklog = new Set(
         [...recentRecommendedAppIds, ...mergedExcludedSessionAppIds]
           .map((id) => Number(id))
