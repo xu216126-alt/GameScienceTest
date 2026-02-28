@@ -1,0 +1,342 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>SteamSense AI | 基于库存的游戏推荐</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link
+      href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;500;700&family=Syne:wght@600;700;800&family=Noto+Sans+SC:wght@400;700;900&family=ZCOOL+KuaiLe&display=swap"
+      rel="stylesheet"
+    />
+    <link rel="stylesheet" href="styles.css" />
+  </head>
+  <body>
+    <div class="background-grid" aria-hidden="true"></div>
+    <canvas id="text-rain" class="text-rain" aria-hidden="true"></canvas>
+
+    <header class="site-header">
+      <div class="brand">
+        <span class="brand-orb"></span>
+        <span class="brand-name">SteamSense AI</span>
+      </div>
+      <div class="header-actions">
+        <button id="how-it-works" class="ghost-btn" type="button">了解原理</button>
+      </div>
+    </header>
+
+    <main>
+      <nav class="flow-progress" aria-label="Setup progress">
+        <div id="progress-step-1" class="progress-item is-active">
+          <span class="progress-dot">1</span>
+          <span id="progress-label-1" class="progress-text">身份</span>
+        </div>
+        <div id="progress-step-2" class="progress-item">
+          <span class="progress-dot">2</span>
+          <span id="progress-label-2" class="progress-text">硬件</span>
+        </div>
+        <div id="progress-step-3" class="progress-item">
+          <span class="progress-dot">3</span>
+          <span id="progress-label-3" class="progress-text">分析</span>
+        </div>
+      </nav>
+
+      <section class="step-panel is-active reveal" id="step-1" data-step="1">
+        <p id="step1-title" class="eyebrow">第1步 · 登录与身份</p>
+        <h1 id="step1-headline">连接你的 Steam 身份，开始命运扫描。</h1>
+        <p id="step1-copy" class="hero-copy">你可以使用 Steam OpenID 登录或手动输入 SteamID64。</p>
+        <div class="auth-panel" id="auth-section">
+          <button id="steam-login-btn" class="steam-login-btn" type="button">
+            <span class="steam-icon">S</span>
+            <span id="login-steam">使用 Steam 登录</span>
+          </button>
+          <label id="label-steam-id" for="steam-id">或手动输入 Steam ID</label>
+          <div class="auth-row">
+            <input id="steam-id" type="text" placeholder="例如：76561198000000000" />
+            <button id="analyze-btn" class="primary-btn" type="button">下一步</button>
+          </div>
+          <p id="step1-status" class="microcopy">等待 Steam 身份验证...</p>
+        </div>
+      </section>
+
+      <section class="step-panel" id="step-2" data-step="2">
+        <p id="step2-title" class="eyebrow">第2步 · 硬件配置</p>
+        <h2 id="step2-headline">设置设备规格，以准确评估可玩性。</h2>
+        <div class="auth-panel">
+          <div class="device-panel">
+            <label id="label-device-type" for="device-type">设备类型</label>
+            <select id="device-type">
+              <option id="opt-pc" value="pc">PC</option>
+              <option id="opt-handheld" value="handheld">掌机</option>
+            </select>
+            <div id="pc-specs" class="device-grid">
+              <div>
+                <label id="label-cpu-tier" for="pc-cpu">CPU 等级</label>
+                <select id="pc-cpu">
+                  <option id="opt-cpu-entry" value="entry">入门（4 核 / 老款 i5）</option>
+                  <option id="opt-cpu-mid" value="mid" selected>中端（新款 i5 / Ryzen 5）</option>
+                  <option id="opt-cpu-high" value="high">高端（i7 / Ryzen 7+）</option>
+                </select>
+              </div>
+              <div>
+                <label id="label-gpu-tier" for="pc-gpu">GPU 等级</label>
+                <select id="pc-gpu">
+                  <option id="opt-gpu-integrated" value="integrated">核显 / 低端</option>
+                  <option id="opt-gpu-mid" value="mid" selected>中端（GTX 1660 / RTX 3060）</option>
+                  <option id="opt-gpu-high" value="high">高端（RTX 4070+）</option>
+                </select>
+              </div>
+              <div>
+                <label id="label-memory" for="pc-ram">内存</label>
+                <select id="pc-ram">
+                  <option value="8">8 GB</option>
+                  <option value="16" selected>16 GB</option>
+                  <option value="32">32 GB+</option>
+                </select>
+              </div>
+            </div>
+            <div id="handheld-specs" class="device-grid is-hidden">
+              <div>
+                <label id="label-handheld-model" for="handheld-model">掌机型号</label>
+                <select id="handheld-model">
+                  <option value="steam_deck">Steam Deck</option>
+                  <option value="steam_deck_oled">Steam Deck OLED</option>
+                  <option value="rog_ally">ROG Ally</option>
+                  <option value="rog_ally_x">ROG Ally X</option>
+                  <option value="legion_go">Lenovo Legion Go</option>
+                  <option value="msi_claw">MSI Claw</option>
+                  <option value="ayaneo_2">Ayaneo 2</option>
+                  <option value="ayaneo_kun">Ayaneo Kun</option>
+                  <option value="ayaneo_next">Ayaneo Next</option>
+                  <option value="gpd_win4">GPD Win 4</option>
+                  <option value="gpd_win_max">GPD Win Max</option>
+                  <option value="onexplayer">OneXPlayer</option>
+                  <option value="other">其他掌机</option>
+                </select>
+              </div>
+            </div>
+          </div>
+
+          <div class="step-actions">
+            <button id="back-to-step1-btn" class="ghost-btn" type="button">返回</button>
+            <button id="step2-analyze-btn" class="primary-btn" type="button">开始命运解析</button>
+          </div>
+        </div>
+      </section>
+
+      <section class="step-panel" id="step-3" data-step="3">
+        <div id="soul-loading" class="soul-loading is-hidden">
+          <span class="loader-orb"></span>
+          <p id="soul-loading-text">正在读取你的游戏灵魂...</p>
+        </div>
+
+        <div id="step3-content">
+          <section class="analysis-card" id="analysis-output" aria-live="polite">
+            <div class="hud-header-grid">
+              <div class="hud-top-row">
+                <aside class="hud-identity-panel" aria-label="个人信息">
+                  <h3 class="hud-panel-title">个人信息</h3>
+                  <div class="profile-card profile-panel" id="profile-panel">
+                    <div class="avatar-ring-wrap">
+                      <img
+                        id="profile-avatar"
+                        class="profile-avatar"
+                        src="https://avatars.akamai.steamstatic.com/7f8ecf95a35f9f6f8e6af4af34f748109f5e2b5a_full.jpg"
+                        alt="Steam 头像"
+                      />
+                    </div>
+                    <div class="profile-meta">
+                      <div class="profile-head-row">
+                        <h3 id="profile-name" class="profile-name-with-status">访客</h3>
+                        <span class="status-light" aria-hidden="true"><span class="status-dot"></span> SYSTEM LINK ACTIVE</span>
+                        <button id="logout-btn" class="ghost-btn logout-btn" type="button">退出登录</button>
+                      </div>
+                      <p id="profile-id">Steam ID：未连接</p>
+                      <div class="profile-stats hud-stat-badges">
+                        <article class="stat-badge stat-badge--games">
+                          <span id="stat-label-games" class="stat-label">库内游戏数</span>
+                          <strong id="stat-games">-</strong>
+                        </article>
+                        <article class="stat-badge stat-badge--playtime">
+                          <span id="stat-label-playtime" class="stat-label">总游戏时长</span>
+                          <strong id="stat-playtime">-</strong>
+                        </article>
+                      </div>
+                      <a id="profile-link" class="profile-link" href="#" target="_blank" rel="noreferrer">打开 Steam 主页</a>
+                    </div>
+                  </div>
+                  <div class="hardware-info" id="hardware-info" aria-label="当前硬件摘要"></div>
+                  <div class="hud-status-footer" aria-hidden="true"><span class="rec-dot"></span> LINK: ESTABLISHED</div>
+                </aside>
+                <aside class="hud-persona-panel" aria-label="游戏人格">
+                  <h3 class="hud-panel-title">游戏人格</h3>
+                  <div class="persona-panel" id="persona-panel">
+                    <div class="persona-code-wrap">
+                      <span id="persona-label" class="persona-label">游戏人格</span>
+                      <strong id="persona-code">----</strong>
+                    </div>
+                    <div class="persona-main">
+                      <div class="persona-body">
+                        <div class="persona-copy">
+                          <h3 id="persona-name">人格待生成</h3>
+                          <p id="persona-review">分析你的资料后生成 4 字母人格与幽默评语。</p>
+                        </div>
+                        <div class="persona-stats" id="persona-stats" aria-label="五维属性">
+                          <div class="persona-stat-row" data-attr="action"><span class="persona-stat-label">操作</span><div class="persona-stat-bar"><div class="persona-stat-fill" style="width: 50%"></div></div><span class="persona-stat-value">50</span></div>
+                          <div class="persona-stat-row" data-attr="strategy"><span class="persona-stat-label">策略</span><div class="persona-stat-bar"><div class="persona-stat-fill" style="width: 50%"></div></div><span class="persona-stat-value">50</span></div>
+                          <div class="persona-stat-row" data-attr="exploration"><span class="persona-stat-label">探索</span><div class="persona-stat-bar"><div class="persona-stat-fill" style="width: 50%"></div></div><span class="persona-stat-value">50</span></div>
+                          <div class="persona-stat-row" data-attr="social"><span class="persona-stat-label">社交</span><div class="persona-stat-bar"><div class="persona-stat-fill" style="width: 50%"></div></div><span class="persona-stat-value">50</span></div>
+                          <div class="persona-stat-row" data-attr="immersion"><span class="persona-stat-label">沉浸</span><div class="persona-stat-bar"><div class="persona-stat-fill" style="width: 50%"></div></div><span class="persona-stat-value">50</span></div>
+                        </div>
+                      </div>
+                      <div class="persona-traits" id="persona-traits"></div>
+                      <div class="persona-meta" id="persona-meta" aria-hidden="true">ANALYSIS_LOG_V2.0 // SYNC_STATUS: STABLE</div>
+                    </div>
+                  </div>
+                </aside>
+              </div>
+              <main class="hud-summary-panel" aria-label="命运洞察">
+                <div class="ai-summary-container">
+                  <h2 class="hud-panel-title hud-panel-title--wide">命运洞察</h2>
+                  <h2 class="oracle-heading">Destiny Insight</h2>
+                  <div class="oracle-terminal-box">
+                    <div class="card-head">
+                      <h3 id="analysis-title" class="oracle-title">AI 玩家画像分析</h3>
+                    </div>
+                    <p id="analysis-summary" class="oracle-text">正在准备你的专属分析...</p>
+                    <div id="refining-area" class="refining-area">
+                      <div id="refining-indicator" class="refining-indicator is-hidden" aria-live="polite">
+                        <span class="refining-spinner" aria-hidden="true"></span>
+                        <span id="refining-indicator-text">进一步占卜中</span>
+                      </div>
+                      <button id="deeper-insights-btn" class="ghost-btn deeper-insights-btn is-hidden" type="button">获取深度预言</button>
+                    </div>
+                    <div class="tags" id="playstyle-tags"></div>
+                  </div>
+                </div>
+              </main>
+            </div>
+          </section>
+
+          <section class="cyber-tarot-section" id="cyber-tarot-section" aria-label="赛博塔罗今日运势">
+            <h2 class="cyber-tarot-title">赛博塔罗 · 今日运势</h2>
+            <p class="cyber-tarot-hint">点击牌面抽取今日运势与本命游戏</p>
+            <div class="tarot-flip-wrap">
+              <div class="tarot-card" id="tarot-card" role="button" tabindex="0" aria-label="点击翻转塔罗牌">
+                <div class="tarot-card-inner">
+                  <div class="tarot-card-back">
+                    <span class="tarot-motif">X</span>
+                    <span class="tarot-motif">Y</span>
+                    <span class="tarot-motif">A</span>
+                    <span class="tarot-motif">B</span>
+                  </div>
+                  <div class="tarot-card-front">
+                    <span class="tarot-card-glow" aria-hidden="true"></span>
+                    <img class="tarot-card-image" id="tarot-card-image" src="" alt="" role="presentation" />
+                    <h2 class="tarot-card-name" id="tarot-card-name">——</h2>
+                  </div>
+                </div>
+              </div>
+            </div>
+            <div class="tarot-fortune-wrap is-hidden" id="tarot-fortune-wrap">
+              <p class="tarot-fortune-label">运势解读</p>
+              <p class="tarot-fortune-text" id="tarot-fortune-text"></p>
+            </div>
+            <div class="tarot-destiny-game-wrap is-hidden" id="tarot-destiny-game-wrap">
+              <p class="tarot-destiny-label">本命游戏</p>
+              <div class="tarot-destiny-card" id="tarot-destiny-card"></div>
+            </div>
+            <p class="tarot-loading is-hidden" id="tarot-loading">正在连接赛博神谕…</p>
+            <p class="tarot-error is-hidden" id="tarot-error"></p>
+          </section>
+
+          <div class="tactical-filter-bar" id="tactical-filter-bar">
+            <div class="scenario-container">
+              <div class="context-head">
+                <h3 id="context-title">游戏场景</h3>
+                <p id="context-copy" class="gaming-context-copy">根据中国作息自动选择，你可以手动切换。</p>
+              </div>
+              <div class="mode-toggle-group" role="group" aria-label="游戏场景">
+                <button id="mode-pickles" class="mode-toggle is-active" type="button" data-mode="pickles">
+                  <span class="mode-icon mode-icon--clock" aria-hidden="true">⏱</span>
+                  <span id="mode-pickles-label">碎片时间</span>
+                  <small id="mode-pickles-sub">轻量</small>
+                </button>
+                <button id="mode-flow" class="mode-toggle" type="button" data-mode="flow">
+                  <span class="mode-icon mode-icon--mountain" aria-hidden="true">⛰</span>
+                  <span id="mode-flow-label">沉浸时光</span>
+                  <small id="mode-flow-sub">深度</small>
+                </button>
+              </div>
+            </div>
+            <a href="#cyber-tarot-section" class="tactical-tarot-entry" id="tactical-tarot-entry" aria-label="今日运势 赛博占卜">今日运势</a>
+          </div>
+
+          <section class="recommendations">
+            <div class="recommendations-head">
+              <div>
+                <h2 id="recommendation-title">推荐场景</h2>
+                <p id="destiny-hint" class="microcopy">点击「查看详情」可查看推荐理由与命运链接。</p>
+              </div>
+              <div class="recommendations-head-actions">
+                <span class="status-pill" id="status-pill" aria-live="polite">等待资料</span>
+                <button id="refresh-btn" class="ghost-btn refresh-btn" type="button">刷新推荐</button>
+              </div>
+            </div>
+            <div class="recommendation-grid" id="recommendation-grid"></div>
+          </section>
+          <div class="step-actions">
+            <button id="back-to-step2-btn" class="ghost-btn" type="button">编辑硬件</button>
+            <button id="start-over-btn" class="primary-btn" type="button">重新开始</button>
+          </div>
+        </div>
+      </section>
+    </main>
+
+    <footer class="site-footer">
+      <p id="footer-copy">SteamSense AI 演示体验</p>
+    </footer>
+
+    <dialog id="game-modal" class="game-modal">
+      <div class="modal-head">
+        <h3 id="modal-title">游戏详情</h3>
+        <button id="close-modal" class="ghost-btn" type="button">关闭</button>
+      </div>
+      <div id="modal-body" class="modal-body"></div>
+    </dialog>
+
+    <dialog id="how-it-works-modal" class="how-it-works-modal" aria-labelledby="how-it-works-title" aria-describedby="how-it-works-body">
+      <div class="how-it-works-inner">
+        <div class="how-it-works-head">
+          <h2 id="how-it-works-title" class="how-it-works-title">SteamSense AI · 网页架构与功能</h2>
+          <button id="how-it-works-close" class="ghost-btn" type="button" aria-label="关闭">关闭</button>
+        </div>
+        <div id="how-it-works-body" class="how-it-works-body">
+          <section class="how-it-works-section">
+            <h3>整体流程</h3>
+            <p>页面分为三步：<strong>身份</strong>（Steam 登录或输入 SteamID64）→ <strong>硬件</strong>（选择设备类型与配置，用于评估游戏可玩性）→ <strong>分析</strong>（生成命运洞察与推荐列表）。完成前两步后进入分析页，系统会拉取你的 Steam 资料并调用 AI 生成个性化内容。</p>
+          </section>
+          <section class="how-it-works-section">
+            <h3>命运洞察</h3>
+            <p>分析页顶部展示 <strong>个人信息</strong>（头像、Steam ID、库内游戏数、总时长、硬件摘要）与 <strong>游戏人格</strong>（四字母人格代号、五维属性条、性格标签、人格评语）。下方为 AI 撰写的 <strong>命运洞察</strong> 长段分析，以及本页推荐的总体导向。右侧「分析完成」状态与「刷新推荐」按钮位于推荐列表上方，点击刷新会重新请求 AI 并更新推荐与洞察文案。</p>
+          </section>
+          <section class="how-it-works-section">
+            <h3>游戏场景与推荐</h3>
+            <p>在 <strong>游戏场景</strong> 中可选择「碎片时间」（轻量、短局）或「沉浸时光」（深度、长线）。切换场景会像点击「刷新推荐」一样重新拉取推荐列表。推荐区按场景展示多条推荐 lane，每张卡片可点击「查看详情」打开弹窗，查看推荐理由、命运链接与商店信息。</p>
+          </section>
+          <section class="how-it-works-section">
+            <h3>赛博塔罗 · 今日运势</h3>
+            <p>趣味模块：点击「今日运势」进入占卜仪式，牌面颤动后翻转，展示当日抽到的赛博塔罗牌与 AI 生成的运势解读，并推荐一款 <strong>本命游戏</strong>。每人每天仅可抽取一次（按自然日与账号区分），结果会缓存以便再次访问时直接展示。</p>
+          </section>
+          <section class="how-it-works-section">
+            <h3>技术要点</h3>
+            <p>后端会拉取 Steam 公开资料与游戏库，并利用 Redis 做差分分析（对比上次与本次游玩变化），将差异化信息注入 AI 提示，以生成更贴合近期动态的问候与推荐。AI 提供多路容错与超时兜底；当 AI 不可用时，会从预设/热门游戏池中按场景与标签做个性化兜底推荐。会话内「刷新」会排除已推荐过的游戏，避免重复出现。</p>
+          </section>
+        </div>
+      </div>
+    </dialog>
+
+    <script src="script.js"></script>
+  </body>
+</html>
