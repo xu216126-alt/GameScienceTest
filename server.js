@@ -596,7 +596,10 @@ async function getFallbackPoolGamesFromRedis(
   preferredTags = [],
   currentScenario = 'pickles'
 ) {
-  if (!redisClient || !redisHealthy) return [];
+  if (!redisClient || !redisHealthy) {
+    console.log('[fallback-pool] Redis unavailable, returning []');
+    return [];
+  }
   const ownedSet = new Set((ownedAppIds || []).map((id) => Number(id)).filter((id) => Number.isInteger(id) && id > 0));
   const blacklistSet = new Set((sessionBlacklistAppIds || []).map((id) => Number(id)).filter((id) => Number.isInteger(id) && id > 0));
   try {
@@ -607,6 +610,7 @@ async function getFallbackPoolGamesFromRedis(
 
     let rawList = [];
     const v2Size = await redisClient.zCard(FALLBACK_POOL_KEY_V2).catch(() => 0);
+    console.log('[fallback-pool] v2Size=', v2Size, 'blacklistSize=', blacklistSet.size, 'ownedSize=', ownedSet.size);
     if (v2Size > 0) {
       const windowSize = Math.min(FALLBACK_POOL_TOP_N_FOR_PICK, v2Size);
       let rangeStart = 0;
@@ -650,6 +654,7 @@ async function getFallbackPoolGamesFromRedis(
     const baseFiltered = entries.filter(
       (e) => e && !ownedSet.has(e.id) && !blacklistSet.has(e.id)
     );
+    console.log('[fallback-pool] rawList=', rawList.length, 'parsed=', entries.length, 'baseFiltered=', baseFiltered.length);
     if (baseFiltered.length === 0) return [];
 
     const scenarioKey = SCENARIO_ALIASES[currentScenario] || (currentScenario === 'flow' ? 'flow' : 'pickles');
@@ -728,8 +733,10 @@ async function getFallbackPoolGamesFromRedis(
       }
     }
 
+    console.log('[fallback-pool] selected count=', selected.length);
     return selected;
-  } catch {
+  } catch (err) {
+    console.warn('[fallback-pool] getFallbackPoolGamesFromRedis error:', err?.message ?? err);
     return [];
   }
 }
@@ -2852,14 +2859,17 @@ const server = http.createServer(async (req, res) => {
       let usedFallback = false;
       let aiProvider = 'destiny-prediction-light';
       let aiError = '';
+      console.log('[ai-analysis] steamId=', steamId?.slice(-6), 'redisHealthy=', redisHealthy);
       try {
         const aiResult = await callAiForAnalysis(aiContext);
         aiOutput = aiResult.analysis;
         aiProvider = aiResult.providerUsed || 'primary';
         await setProfileSnapshot(steamId, buildRecentSnapshot(profile));
+        console.log('[ai-analysis] AI ok, provider=', aiProvider);
       } catch (error) {
         usedFallback = true;
         aiError = String(error?.message || 'Unknown AI provider error');
+        console.log('[ai-analysis] AI failed, using fallback:', aiError?.slice(0, 80));
         aiOutput = buildLocalFallbackAnalysis(profile, deviceProfile, lang);
         const preferredTags = Array.isArray(aiOutput?.topPreferenceTags) ? aiOutput.topPreferenceTags : [];
         const hoursHint = getHoursHintForFallback(profile);
@@ -2871,6 +2881,7 @@ const server = http.createServer(async (req, res) => {
           preferredTags,
           selectedMode
         );
+        console.log('[ai-analysis] fallbackIds.length=', fallbackIds?.length ?? 0);
         if (fallbackIds.length > 0) {
           const laneKeys = ['trendingOnline', 'tasteMatch', 'exploreNewAreas'];
           const perLane = [5, 5, 5];
@@ -2958,6 +2969,11 @@ const server = http.createServer(async (req, res) => {
       if (uniqueNewlyRecommended.length) {
         await addToSessionBlacklist(steamId, uniqueNewlyRecommended);
       }
+
+      const scenarioCounts = Object.fromEntries(
+        Object.entries(scenariosWithoutDaily || {}).map(([k, v]) => [k, (v?.games || []).length])
+      );
+      console.log('[ai-analysis] response usedFallback=', usedFallback, 'scenarioCounts=', JSON.stringify(scenarioCounts));
 
       sendJson(res, 200, {
         summary: aiOutput.summary,
