@@ -1552,6 +1552,20 @@ async function getGameDetailsStrict(appId, lang = 'en-US') {
   return details;
 }
 
+/** 带重试的 getGameDetailsStrict，失败时等待 delayMs 后重试，最多 retries 次 */
+async function getGameDetailsStrictWithRetry(appId, lang = 'en-US', retries = 2, delayMs = 600) {
+  let lastErr;
+  for (let i = 0; i <= retries; i++) {
+    try {
+      return await getGameDetailsStrict(appId, lang);
+    } catch (e) {
+      lastErr = e;
+      if (i < retries && delayMs > 0) await new Promise((r) => setTimeout(r, delayMs));
+    }
+  }
+  throw lastErr;
+}
+
 function extractFirstJson(text) {
   const fenceMatch = text.match(/```json\s*([\s\S]*?)```/i);
   if (fenceMatch) return fenceMatch[1].trim();
@@ -2517,12 +2531,15 @@ function buildLocalFallbackAnalysis(profile, deviceProfile, lang = 'en-US') {
   };
 }
 
-async function enrichScenariosWithStoreData(scenarios, forbiddenAppIds = [], lang = 'en-US') {
+async function enrichScenariosWithStoreData(scenarios, forbiddenAppIds = [], lang = 'en-US', options = {}) {
   const enriched = {};
   const used = new Set();
   const hardForbidden = new Set(
     (forbiddenAppIds || []).map((id) => Number(id)).filter((id) => Number.isInteger(id) && id > 0)
   );
+  const alternatePool = Array.isArray(options.alternatePool)
+    ? options.alternatePool.map((id) => Number(id)).filter((id) => Number.isInteger(id) && id > 0)
+    : [];
   const prefetchIds = new Set();
 
   for (const [key, lane] of Object.entries(scenarios || {})) {
@@ -2538,13 +2555,49 @@ async function enrichScenariosWithStoreData(scenarios, forbiddenAppIds = [], lan
   await Promise.all(
     [...prefetchIds].map(async (appId) => {
       try {
-        const details = await getGameDetailsStrict(appId, lang);
+        const details = await getGameDetailsStrictWithRetry(appId, lang, 2, 600);
         prefetchedDetails.set(appId, details);
       } catch {
-        // Skip invalid IDs; they may be filled by replacements.
+        // 预取失败，后面会尝试备用池替换或占位
       }
     })
   );
+
+  const tryAlternateForSlot = async (g, key) => {
+    const shouldSkipForbidden = key !== 'backlogReviver';
+    for (const altId of alternatePool) {
+      if (used.has(altId) || (shouldSkipForbidden && hardForbidden.has(altId))) continue;
+      try {
+        const details = await getGameDetailsStrictWithRetry(altId, lang, 2, 600);
+        used.add(altId);
+        const releaseDate = details.releaseDate || '';
+        const newRelease = isNewRelease(releaseDate);
+        const reason = newRelease ? buildNewReleaseReason(lang) : (g.reason || '');
+        return {
+          appId: details.appId,
+          name: details.name,
+          mediaType: 'image',
+          media: details.posterImage || details.headerImage,
+          mediaFallback: details.headerImage,
+          positiveRate: details.positiveRate,
+          players: details.currentPlayers,
+          price: details.price,
+          releaseDate,
+          isNewRelease: newRelease,
+          reason,
+          compatibility: g.compatibility || 'playable',
+          handheldCompatibility: g.handheldCompatibility || 'unknown',
+          destinyLink: g.destinyLink || '',
+          destinyType: g.destinyType || 'philosophical_echoes',
+          destinyScore: Number.isFinite(Number(g.destinyScore)) ? Math.max(0, Math.min(100, Math.round(Number(g.destinyScore)))) : 0,
+          fromLibrary: Boolean(g.fromLibrary),
+        };
+      } catch {
+        continue;
+      }
+    }
+    return null;
+  };
 
   for (const [key, lane] of Object.entries(scenarios)) {
     const games = [];
@@ -2552,7 +2605,7 @@ async function enrichScenariosWithStoreData(scenarios, forbiddenAppIds = [], lan
       const appId = Number(g.appId);
       const shouldSkipForbidden = key !== 'backlogReviver';
       if (!Number.isInteger(appId) || appId <= 0 || used.has(appId) || (shouldSkipForbidden && hardForbidden.has(appId))) continue;
-      const details = prefetchedDetails.get(appId);
+      let details = prefetchedDetails.get(appId);
       used.add(appId);
       if (details) {
         const releaseDate = details.releaseDate || '';
@@ -2578,25 +2631,32 @@ async function enrichScenariosWithStoreData(scenarios, forbiddenAppIds = [], lan
           fromLibrary: Boolean(g.fromLibrary),
         });
       } else {
-        games.push({
-          appId,
-          name: `App ${appId}`,
-          mediaType: 'image',
-          media: `https://cdn.akamai.steamstatic.com/steam/apps/${appId}/library_600x900.jpg`,
-          mediaFallback: `https://cdn.akamai.steamstatic.com/steam/apps/${appId}/header.jpg`,
-          positiveRate: '',
-          players: '',
-          price: '',
-          releaseDate: '',
-          isNewRelease: false,
-          reason: g.reason || (lang === 'zh-CN' ? '命运线与此作交汇，值得一试。' : 'A destiny link—worth a try.'),
-          compatibility: g.compatibility || 'playable',
-          handheldCompatibility: g.handheldCompatibility || 'unknown',
-          destinyLink: g.destinyLink || '',
-          destinyType: g.destinyType || 'philosophical_echoes',
-          destinyScore: Number.isFinite(Number(g.destinyScore)) ? Math.max(0, Math.min(100, Math.round(Number(g.destinyScore)))) : 0,
-          fromLibrary: Boolean(g.fromLibrary),
-        });
+        used.delete(appId);
+        const substituted = await tryAlternateForSlot(g, key);
+        if (substituted) {
+          games.push(substituted);
+        } else {
+          used.add(appId);
+          games.push({
+            appId,
+            name: `App ${appId}`,
+            mediaType: 'image',
+            media: `https://cdn.akamai.steamstatic.com/steam/apps/${appId}/library_600x900.jpg`,
+            mediaFallback: `https://cdn.akamai.steamstatic.com/steam/apps/${appId}/header.jpg`,
+            positiveRate: '',
+            players: '',
+            price: '',
+            releaseDate: '',
+            isNewRelease: false,
+            reason: g.reason || (lang === 'zh-CN' ? '命运线与此作交汇，值得一试。' : 'A destiny link—worth a try.'),
+            compatibility: g.compatibility || 'playable',
+            handheldCompatibility: g.handheldCompatibility || 'unknown',
+            destinyLink: g.destinyLink || '',
+            destinyType: g.destinyType || 'philosophical_echoes',
+            destinyScore: Number.isFinite(Number(g.destinyScore)) ? Math.max(0, Math.min(100, Math.round(Number(g.destinyScore)))) : 0,
+            fromLibrary: Boolean(g.fromLibrary),
+          });
+        }
       }
     }
 
@@ -3000,7 +3060,8 @@ const server = http.createServer(async (req, res) => {
       const enrichedScenarios = await enrichScenariosWithStoreData(
         repairedNonOwned,
         [...recentRecommendedAppIds, ...mergedExcludedSessionAppIds],
-        lang
+        lang,
+        { alternatePool: [...TRENDING_FALLBACK_POOL] }
       );
       // Only repair empty lanes when AI provider succeeded.
       // Do not inject pool picks in local fallback mode.
@@ -3026,6 +3087,7 @@ const server = http.createServer(async (req, res) => {
       const nonBacklogKeys = ['trendingOnline', 'tasteMatch', 'exploreNewAreas'];
       const totalNonBacklog = nonBacklogKeys.reduce((sum, k) => sum + (scenariosWithoutDaily?.[k]?.games?.length || 0), 0);
       let rescueFilled = null;
+      let rescueCandidateIds = [];
       if (totalNonBacklog === 0 && redisClient && redisHealthy) {
         const rescueIds = await getFallbackPoolGamesFromRedis(
           profile.ownedAppIds,
@@ -3037,6 +3099,7 @@ const server = http.createServer(async (req, res) => {
         );
         if (rescueIds.length > 0) {
           console.log('[ai-analysis] all lanes empty, filling from Redis rescue pool:', rescueIds.length);
+          rescueCandidateIds = rescueIds;
           const fallbackScenarios = getFallbackScenariosForLang(lang);
           const perLane = [5, 5, 5];
           let idx = 0;
@@ -3076,6 +3139,7 @@ const server = http.createServer(async (req, res) => {
           );
           if (hardcodedIds.length > 0) {
             console.log('[ai-analysis] Redis rescue empty, using hardcoded fallback:', hardcodedIds.length);
+            rescueCandidateIds = hardcodedIds;
             const fallbackScenarios = getFallbackScenariosForLang(lang);
             rescueFilled = { ...scenariosWithoutDaily };
             const perLane = [3, 3, 3];
@@ -3113,10 +3177,14 @@ const server = http.createServer(async (req, res) => {
         }
       }
       if (rescueFilled) {
+        const rescueAlternatePool = rescueCandidateIds.length
+          ? [...rescueCandidateIds, ...TRENDING_FALLBACK_POOL]
+          : [...TRENDING_FALLBACK_POOL];
         scenariosWithoutDaily = await enrichScenariosWithStoreData(
           rescueFilled,
           [...recentRecommendedAppIds, ...mergedExcludedSessionAppIds],
-          lang
+          lang,
+          { alternatePool: rescueAlternatePool }
         );
       }
 
