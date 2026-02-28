@@ -497,6 +497,8 @@ let scenarioSwitchInProgress = false;
 const STEP2_PREFETCH_DEBOUNCE_MS = 600;
 const HISTORY_STORAGE_KEY = "steamsense.recommendationHistory.v1";
 const SESSION_STORAGE_KEY = "steamsense.session.v1";
+/** 刷新用缓存池：后台预取的一组推荐结果，用户点刷新时先展示再背后补请求 */
+let refreshCache = null;
 
 const refreshFlavors = [
   "focus on indie gems",
@@ -949,6 +951,34 @@ function applyAiResult(ai, order = null, options = {}) {
   renderRecommendations(currentScenarioData, currentScenarioOrder);
   collectScenarioAppIds(currentScenarioData).forEach((id) => recommendationHistory.add(id));
   if (currentSteamId) savePersistedHistoryForSteamId(currentSteamId);
+}
+
+/** 后台预取一组“下一轮刷新”的推荐结果并写入缓存池，不阻塞 UI */
+function startBackgroundRefreshPrefetch() {
+  if (!currentSteamId || currentStep !== 3 || !currentProfileData) return;
+  const flavor = pickRefreshFlavor();
+  const nextRefreshIndex = refreshCount + 1;
+  const anglePack = scenarioAnglePacks[nextRefreshIndex % scenarioAnglePacks.length];
+  const order = shuffledScenarioOrder();
+  const refreshToken = `prefetch-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+  fetchAiAnalysis(
+    currentSteamId,
+    getCurrentProfileHint(),
+    refreshToken,
+    {
+      isRefresh: true,
+      flavor,
+      scenarioAnglePack: anglePack,
+      scenarioOrder: order,
+      temperature: 0.88,
+    }
+  )
+    .then((data) => {
+      if (currentSteamId && data && data.scenarios) {
+        refreshCache = { data, order };
+      }
+    })
+    .catch(() => {});
 }
 
 function startPrefetchAnalysis() {
@@ -1505,6 +1535,7 @@ function resetToLoggedOutState() {
   currentSteamId = "";
   currentProfileData = null;
   refreshCount = 0;
+  refreshCache = null;
   currentScenarioOrder = null;
   sessionHasActivityDiff = false;
   prefetchAnalysisPromise = null;
@@ -1555,6 +1586,7 @@ async function handleAnalyze() {
       recommendationHistory.clear();
       loadPersistedHistoryForSteamId(steamId).forEach((id) => recommendationHistory.add(id));
       refreshCount = 0;
+      refreshCache = null;
       currentScenarioOrder = null;
     }
     currentSteamId = steamId;
@@ -1578,6 +1610,7 @@ async function handleAnalyze() {
       recommendationHistory.clear();
       loadPersistedHistoryForSteamId(steamId).forEach((id) => recommendationHistory.add(id));
       refreshCount = 0;
+      refreshCache = null;
       currentScenarioOrder = null;
     }
     const profile = await fetchSteamProfile(steamId);
@@ -1671,6 +1704,7 @@ async function handleStep2Analyze() {
       })();
     }
     setStatus(t("analysisComplete"), "#39d6c6");
+    startBackgroundRefreshPrefetch();
   } catch (error) {
     isAnalyzing = false;
     setStatus(t("errorLabel"), "#ff6c7a");
@@ -1690,6 +1724,19 @@ async function handleRefreshRecommendations() {
   if (!currentSteamId || currentStep !== 3) {
     setStatus(t("noProfile"), "#ff6c7a");
     summary.textContent = t("openAnalysisFirst");
+    return;
+  }
+
+  // 有缓存：先展示缓存，再背后请求并写入新缓存
+  if (refreshCache) {
+    const { data, order } = refreshCache;
+    refreshCache = null;
+    refreshCount += 1;
+    applyAiResult(data, order, { updatePersona: false });
+    summary.textContent = data.summary || t("refresh");
+    setStatus(t("analysisComplete"), "#39d6c6");
+    renderRecommendations(currentScenarioData, currentScenarioOrder);
+    startBackgroundRefreshPrefetch();
     return;
   }
 
@@ -1720,6 +1767,7 @@ async function handleRefreshRecommendations() {
 
     summary.textContent = ai.summary || t("refresh");
     setStatus(t("analysisComplete"), "#39d6c6");
+    startBackgroundRefreshPrefetch();
   } catch (error) {
     setStatus(t("errorLabel"), "#ff6c7a");
     summary.textContent = error.message;

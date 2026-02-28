@@ -31,11 +31,11 @@ The project is in a **working but network-sensitive** state with a multi-step UI
   - PC: CPU/GPU/RAM
   - Handheld: handheld model
 - Scenario-specific prompting for:
-  - Daily recommendations
-  - Trending online
-  - Taste match
-  - Explore new areas
-  - Backlog Reviver (from library)
+  - Trending online（热门联机）
+  - Taste match（口味匹配）
+  - Explore new areas（探索新领域）
+  - Backlog Reviver（回坑唤醒，from library）
+- **每日推荐** 已移除：该场景由赛博塔罗（今日运势）承担，推荐列表仅保留上述 3 个场景 + 回坑唤醒。
 - Excludes games already owned by user.
 - Short-term session blacklist (excluded app IDs) to reduce duplicates.
 - Includes compatibility labels:
@@ -65,6 +65,7 @@ The project is in a **working but network-sensitive** state with a multi-step UI
 - Refresh button:
   - Uses higher AI temperature and random prompt flavors.
   - Cycles scenario angles to increase variety.
+- **刷新缓存机制**：首次分析或每次刷新成功后，后台静默预取一组「下一轮刷新」结果写入 `refreshCache`；用户点刷新时若有缓存则**先展示缓存**再背后请求并更新缓存，无缓存则走原逻辑（等待接口后同样触发后台预取）。登出或切换 Steam 账号时清空缓存。见 §2.26。
 
 ### 2.6 Localization (Chinese-only)
 - **Language toggle removed.** All UI and visible content are **Chinese only** (`zh-CN`). Frontend uses `currentLang = "zh-CN"` and `t()` reads only from `translations["zh-CN"]`.
@@ -94,7 +95,7 @@ The project is in a **working but network-sensitive** state with a multi-step UI
 
 ### 2.9 Redis-backed Fallback Pool & Trend Surfacing
 - **Initial seed**: On server startup, `seedFallbackPool()` reads `fallback_games.json` (≈200 curated appIds) and seeds both the Redis Set `steam_sense:fallback_pool` and the ZSET `steam_sense:fallback_pool_v2` (see §2.16–2.17). The pool is then refreshed from Steam on a schedule and on first ready.
-- **AI total failure behavior**: If all AI providers fail, `/api/ai-analysis` falls back to `buildLocalFallbackAnalysis` and uses `getFallbackPoolGamesFromRedis` to pull 15 appIds (from ZSET top-100 when v2 is populated, else from Set), filtered against `ownedAppIds` and session blacklist. These are distributed into the four non-backlog scenarios and enriched with full store metadata like normal.
+- **AI total failure behavior**: If all AI providers fail, `/api/ai-analysis` falls back to `buildLocalFallbackAnalysis` and uses `getFallbackPoolGamesFromRedis` to pull 15 appIds (from ZSET top-100 when v2 is populated, else from Set), filtered against `ownedAppIds` and session blacklist. These are distributed into the three non-backlog scenarios (trendingOnline, tasteMatch, exploreNewAreas) and enriched with full store metadata like normal.
 - **Session persistence & auto-skip**: The frontend stores `steamId`, `deviceProfile`, and `lang` in `localStorage` when Step 2 completes. On page load, if a saved session exists, the app auto-hydrates hardware, jumps directly to Step 3 (language is always zh-CN), triggers `/api/steam-profile` and then `/api/ai-analysis`, showing a tech-style loader “正在同步命运数据...” instead of a blank screen.
 - **Welcome-back & trend tags**: When `activityDiff.hasDiff` is present in the restored profile, the UI shows a “Welcome back” / “欢迎回来” toast highlighting the most changed game (top gainer / new recent). All recommendation cards in that session render a small “New Trend” / “基于近期动态” badge on the poster to signal that results are influenced by recent activity.
 - **Redis fallback pool variety**: `getFallbackPoolGamesFromRedis` pulls from ZSET v2 (or Set), filters by `ownedAppIds` and session blacklist, **shuffles** in Node (Fisher-Yates, scenario-aware when `currentScenario` is provided), then takes the requested count (e.g. 32 for distribution across lanes). Per-lane target 5–8 games; fallback pool count and per-lane caps updated so each scenario shows 5–8 games.
@@ -186,6 +187,14 @@ The project is in a **working but network-sensitive** state with a multi-step UI
 - **入口**: 页面右上角「了解原理」按钮。
 - **弹窗**: 使用 `<dialog id="how-it-works-modal">`，包含整页架构与功能说明：整体流程（三步）、命运洞察（个人信息/游戏人格/状态与刷新）、游戏场景与推荐、赛博塔罗今日运势、技术要点（Steam/Redis 差分、AI 兜底、会话去重等）。支持关闭按钮、点击遮罩关闭、Esc 关闭。
 
+### 2.26 推荐列表刷新缓存（前端）
+- **目的**: 缩短用户点击「刷新推荐」后的等待体感。
+- **缓存池**: 前端变量 `refreshCache` 存一份预取结果 `{ data, order }`（与 `/api/ai-analysis` 返回结构一致）。
+- **首次分析后**: 成功展示结果后调用 `startBackgroundRefreshPrefetch()`，后台以 `isRefresh: true` 请求一次，成功则写入 `refreshCache`。
+- **用户点刷新**: 若 `refreshCache` 存在则立即用缓存更新页面并清空缓存，再调用 `startBackgroundRefreshPrefetch()` 补请求并填满缓存；若不存在则原有逻辑（等待接口），成功后同样触发后台预取。
+- **预取参数**: 使用 `refreshCount + 1` 对应的 scenarioAnglePack 与 `shuffledScenarioOrder()`，保证下一轮展示与「真实再点一次刷新」一致。
+- **清空时机**: `resetToLoggedOutState()`、切换 Steam 账号时（`steamId !== currentSteamId`）置 `refreshCache = null`。
+
 ## 3. Key Files
 - Frontend (开发): `index.html`, `styles.css`, `script.js`（根目录）
 - Frontend (Vercel 静态): `public/index.html`, `public/styles.css`, `public/script.js`, `public/images/`
@@ -200,11 +209,8 @@ The project is in a **working but network-sensitive** state with a multi-step UI
 - Port source: `PORT` in `.env` (default `3000`)
 
 ## 4.1 Vercel 部署
-- **vercel.json**：
-  - **builds**：`server.js`（@vercel/node）处理 API；`public/**`（@vercel/static）作为静态资源构建。
-  - **routes**：`/api/(.*)`、`/auth/(.*)` → `server.js`；`/` → `/index.html`；`/(.*)` → `/$1`（由静态构建提供）。
-- **静态资源**：前端静态文件放在 **`public/`** 目录（`public/index.html`、`public/styles.css`、`public/script.js`、`public/images/` 等）。Vercel 的 serverless 函数不会打包这些文件，若全部请求都走 `server.js` 会因读不到文件而返回 `{"error":"Not found"}`；因此改为由静态构建直接提供首页和静态资源，仅接口走 `server.js`。
-- **维护**：根目录的 `index.html`、`styles.css`、`script.js` 为开发源文件；部署时需与 `public/` 内内容保持一致（修改后同步到 `public/` 再提交推送）。
+- **vercel.json**：当前采用**单 build**：`server.js`（@vercel/node），`config.includeFiles: "public/**"` 将静态资源打入函数包；**routes** 全部指向 `server.js`（`/api`、`/auth`、`/(.*)`）。`server.js` 内 `serveStatic` 优先从 `ROOT/public` 提供首页与静态文件。
+- **静态资源**：前端文件放在 **`public/`**（`index.html`、`styles.css`、`script.js`、`images/` 等）；与根目录开发源文件需保持一致，修改后同步到 `public/` 再提交。
 - **Cron**：`GET /api/cron/refresh-pool` 由 Vercel Cron 每 3 天触发（`0 0 */3 * *`）；无需 node-cron。
 - **环境变量**：在 Vercel 控制台配置 `STEAM_API_KEY`、AI 密钥、`UPSTASH_REDIS_REST_URL` / `UPSTASH_REDIS_REST_TOKEN`（或 `REDIS_URL`）等。
 - **导出**：`module.exports = handler` 供 Vercel 调用；仅当 `require.main === module && NODE_ENV !== 'production'` 时执行 `server.listen`。
@@ -292,5 +298,7 @@ The project is in a **working but network-sensitive** state with a multi-step UI
 - [ ] 「分析完成」状态在推荐列表上方、刷新按钮左侧；点击「碎片时间」或「沉浸时光」会像点击「刷新推荐」一样重新拉取推荐。
 - [ ] 游戏人格面板展示五维属性条、3 个性格标签、底部 ANALYSIS_LOG_V2.0 / SYNC 装饰文案。
 - [ ] 右上角「了解原理」点击后弹出介绍弹窗，含架构与功能说明；可关闭/ Esc / 点击遮罩关闭。
-- [ ] Vercel 部署：静态由 `public/` + `@vercel/static` 提供，`/` 与静态资源走静态构建，`/api`、`/auth` 走 `server.js`；推送 Git 后自动部署。
+- [ ] 推荐列表为 3 个场景（热门联机、口味匹配、探索新领域）+ 回坑唤醒，无「每日推荐」场景（由赛博塔罗承担）。
+- [ ] 刷新推荐：有缓存时立即展示再背后请求；无缓存时等待接口后同样触发后台预取；登出/换号清空缓存。
+- [ ] Vercel 部署：单 build（server.js + includeFiles public/**），所有请求走 server.js，静态由 serveStatic 从 public/ 提供；推送 Git 后自动部署。
 - [ ] `npm run test:e2e` passes (Playwright: auto-hydrate, loader buffer, scenario chip fade).
