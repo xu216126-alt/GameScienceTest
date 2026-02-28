@@ -173,6 +173,8 @@ function createUpstashRedisAdapter(upstash) {
   };
 }
 
+// 在 Vercel 上仅使用 Upstash（HTTP），不使用 TCP Redis，避免 "Socket closed unexpectedly"
+const isVercel = Boolean(process.env.VERCEL);
 if (UPSTASH_REDIS_REST_URL && UPSTASH_REDIS_REST_TOKEN) {
   try {
     const { Redis } = require('@upstash/redis');
@@ -198,7 +200,7 @@ if (UPSTASH_REDIS_REST_URL && UPSTASH_REDIS_REST_TOKEN) {
     redisHealthy = false;
     redisClient = null;
   }
-} else if (REDIS_URL) {
+} else if (REDIS_URL && !isVercel) {
   try {
     const { createClient } = require('redis');
     redisClient = createClient({ url: REDIS_URL });

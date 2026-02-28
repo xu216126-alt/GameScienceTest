@@ -5,10 +5,13 @@
     { "src": "server.js", "use": "@vercel/node" }
   ],
   "routes": [
+    { "handle": "filesystem" },
     { "src": "/api/(.*)", "dest": "/server.js" },
     { "src": "/auth/(.*)", "dest": "/server.js" },
-    { "src": "/", "dest": "/index.html" },
-    { "src": "/(.*)", "dest": "/$1" }
+    { "src": "/(.*)", "dest": "/server.js" }
+  ],
+  "rewrites": [
+    { "source": "/", "destination": "/index.html" }
   ],
   "crons": [
     { "path": "/api/cron/refresh-pool", "schedule": "0 0 */3 * *" }
