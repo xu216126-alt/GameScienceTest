@@ -2625,7 +2625,8 @@ function enrichDestinySignals(scenarios, profile, selectedMode, lang = 'en-US') 
   return out;
 }
 
-function ensureScenarioMinimums(scenarios, forbiddenAppIds, lang = 'en-US') {
+/** 补位池：优先从 Upstash/Redis 兜底池取，排除黑名单；无 Redis 或空时用硬编码 TRENDING_FALLBACK_POOL。 */
+async function ensureScenarioMinimums(scenarios, forbiddenAppIds, lang = 'en-US', steamId = '', selectedMode = 'pickles') {
   const requiredKeys = ['trendingOnline', 'tasteMatch', 'exploreNewAreas'];
   const forbidden = new Set((forbiddenAppIds || []).map((id) => Number(id)).filter((id) => Number.isInteger(id) && id > 0));
   const used = new Set();
@@ -2638,6 +2639,19 @@ function ensureScenarioMinimums(scenarios, forbiddenAppIds, lang = 'en-US') {
       if (Number.isInteger(id) && id > 0) used.add(id);
     });
   });
+
+  let poolIds = [];
+  if (redisClient && redisHealthy && steamId) {
+    poolIds = await getFallbackPoolGamesFromRedis(
+      [],
+      forbiddenAppIds || [],
+      25,
+      `${steamId}:ensure:${getDailyFortuneDateString()}`,
+      [],
+      selectedMode
+    );
+  }
+  if (poolIds.length === 0) poolIds = [...TRENDING_FALLBACK_POOL];
 
   const out = { ...scenarios };
   for (const key of requiredKeys) {
@@ -2653,11 +2667,12 @@ function ensureScenarioMinimums(scenarios, forbiddenAppIds, lang = 'en-US') {
       : [];
     const minPerLane = 3;
     const maxPerLane = 5;
-    for (const appId of TRENDING_FALLBACK_POOL) {
+    for (const appId of poolIds) {
       if (games.length >= minPerLane) break;
-      if (forbidden.has(appId) || used.has(appId)) continue;
+      const id = Number(appId);
+      if (!Number.isInteger(id) || id <= 0 || forbidden.has(id) || used.has(id)) continue;
       games.push({
-        appId,
+        appId: id,
         reason: buildMysticalFallbackReason(lang),
         compatibility: 'playable',
         handheldCompatibility: 'unknown',
@@ -2665,7 +2680,7 @@ function ensureScenarioMinimums(scenarios, forbiddenAppIds, lang = 'en-US') {
         destinyType: 'philosophical_echoes',
         destinyScore: 78,
       });
-      used.add(appId);
+      used.add(id);
     }
     const trimmed = games.slice(0, maxPerLane);
     out[key] = {
@@ -2683,6 +2698,37 @@ async function resolvePoolGame(forbiddenSet, lang = 'en-US', metaMap = null) {
   const map = metaMap != null ? metaMap : await getGamesMetaMapWithSteamSpyFirst(candidateIds, lang);
   for (const appId of candidateIds) {
     const details = map.get(Number(appId));
+    if (!details) continue;
+    const isGame = String(details.appType || '').toLowerCase() === 'game';
+    const validName = details.name && !/^App\s+\d+$/i.test(details.name);
+    const validMedia = Boolean(details.headerImage);
+    if (!isGame || !validName || !validMedia) continue;
+    return {
+      appId: details.appId,
+      name: details.name,
+      mediaType: 'image',
+      media: details.posterImage || details.headerImage,
+      mediaFallback: details.headerImage,
+      positiveRate: details.positiveRate,
+      players: details.currentPlayers,
+      price: details.price,
+      reason: buildMysticalFallbackReason(lang),
+      compatibility: 'playable',
+      handheldCompatibility: 'unknown',
+      destinyLink: buildMysticalFallbackReason(lang),
+      destinyType: 'creative_lineage',
+      destinyScore: 82,
+    };
+  }
+  return null;
+}
+
+/** 从 Redis 池 ID 列表 + 已拉取的 metaMap 中选第一个未被 forbidden/used 的游戏条目（供 repair 使用）。 */
+function pickOneGameFromPool(poolIds, poolMeta, forbiddenSet, usedSet, lang = 'en-US') {
+  for (const appId of poolIds || []) {
+    const id = Number(appId);
+    if (!Number.isInteger(id) || id <= 0 || forbiddenSet.has(id) || usedSet.has(id)) continue;
+    const details = poolMeta.get(id);
     if (!details) continue;
     const isGame = String(details.appType || '').toLowerCase() === 'game';
     const validName = details.name && !/^App\s+\d+$/i.test(details.name);
@@ -2788,7 +2834,8 @@ function buildNewReleaseReason(lang = 'en-US') {
   return 'A rising star in the gaming destiny—worth experiencing while it\'s fresh.';
 }
 
-async function repairEmptyNonBacklogLanes(scenarios, forbiddenAppIds, lang = 'en-US') {
+/** 补位空槽：优先从 Upstash/Redis 兜底池取；无 Redis 或池空时用 DIVERSITY_APP_POOL。 */
+async function repairEmptyNonBacklogLanes(scenarios, forbiddenAppIds, lang = 'en-US', steamId = '', selectedMode = 'pickles') {
   const forbidden = new Set((forbiddenAppIds || []).map((id) => Number(id)).filter((id) => Number.isInteger(id) && id > 0));
   const used = new Set();
   const fallbackScenarios = getFallbackScenariosForLang(lang);
@@ -2799,8 +2846,20 @@ async function repairEmptyNonBacklogLanes(scenarios, forbiddenAppIds, lang = 'en
     });
   });
 
-  const poolCandidateIds = DIVERSITY_APP_POOL.filter((id) => !forbidden.has(Number(id)) && !used.has(Number(id)));
-  const poolMeta = poolCandidateIds.length > 0 ? await getGamesMetaMapWithSteamSpyFirst(poolCandidateIds, lang) : new Map();
+  let poolIds = [];
+  if (redisClient && redisHealthy && steamId) {
+    poolIds = await getFallbackPoolGamesFromRedis(
+      [],
+      forbiddenAppIds || [],
+      30,
+      `${steamId}:repair:${getDailyFortuneDateString()}`,
+      [],
+      selectedMode
+    );
+  }
+  const poolMeta = poolIds.length > 0 ? await getGamesMetaMapWithSteamSpyFirst(poolIds, lang) : new Map();
+  const fallbackPoolCandidateIds = poolIds.length === 0 ? DIVERSITY_APP_POOL.filter((id) => !forbidden.has(Number(id)) && !used.has(Number(id))) : [];
+  const fallbackPoolMeta = fallbackPoolCandidateIds.length > 0 ? await getGamesMetaMapWithSteamSpyFirst(fallbackPoolCandidateIds, lang) : new Map();
 
   const out = {};
   for (const [key, lane] of Object.entries(scenarios || {})) {
@@ -2812,7 +2871,9 @@ async function repairEmptyNonBacklogLanes(scenarios, forbiddenAppIds, lang = 'en
     const minPerLane = 3;
     const maxPerLane = 5;
     while (games.length < minPerLane) {
-      const candidate = await resolvePoolGame(new Set([...forbidden, ...used]), lang, poolMeta);
+      const forbidAndUsed = new Set([...forbidden, ...used]);
+      let candidate = poolIds.length > 0 ? pickOneGameFromPool(poolIds, poolMeta, forbidden, used, lang) : null;
+      if (!candidate) candidate = await resolvePoolGame(forbidAndUsed, lang, fallbackPoolMeta);
       if (!candidate) break;
       used.add(Number(candidate.appId));
       games.push(candidate);
@@ -3489,10 +3550,12 @@ const server = http.createServer(async (req, res) => {
         [...profile.ownedAppIds, ...recentRecommendedAppIds, ...mergedExcludedSessionAppIds],
         lang
       );
-      const repairedNonOwned = ensureScenarioMinimums(
+      const repairedNonOwned = await ensureScenarioMinimums(
         diversified,
         [...profile.ownedAppIds, ...recentRecommendedAppIds, ...mergedExcludedSessionAppIds],
-        lang
+        lang,
+        steamId,
+        selectedMode
       );
       const forbiddenForBacklog = new Set(
         [...recentRecommendedAppIds, ...mergedExcludedSessionAppIds]
@@ -3526,7 +3589,9 @@ const server = http.createServer(async (req, res) => {
         : await repairEmptyNonBacklogLanes(
             enrichedScenarios,
             [...profile.ownedAppIds, ...recentRecommendedAppIds, ...mergedExcludedSessionAppIds],
-            lang
+            lang,
+            steamId,
+            selectedMode
           );
       const destinyEnhancedScenarios = enrichDestinySignals(repairedScenarios, profile, selectedMode, lang);
       const finalPersona = isRefresh && personaOverride?.name ? personaOverride : aiOutput?.gamingPersona;
