@@ -46,6 +46,7 @@ function ensureInit() {
         throw new Error('storeService not initialized: call storeService.init(config) first');
     }
 }
+const STEAM_HEADER_CDN = (appId) => `https://shared.fastly.steamstatic.com/store_item_assets/steam/apps/${appId}/header.jpg`;
 function buildGameMeta(appId, data) {
     const id = Number(appId);
     return {
@@ -53,7 +54,7 @@ function buildGameMeta(appId, data) {
         appType: String(data.type || ''),
         name: data.name || `App ${id}`,
         posterImage: `https://cdn.akamai.steamstatic.com/steam/apps/${id}/library_600x900.jpg`,
-        headerImage: data.header_image || `https://cdn.akamai.steamstatic.com/steam/apps/${id}/header.jpg`,
+        headerImage: data.header_image || STEAM_HEADER_CDN(id),
         shortDescription: data.short_description || 'Detailed description is temporarily unavailable for this game.',
         trailerUrl: (() => {
             const m = data.movies?.[0];
@@ -99,22 +100,24 @@ async function fetchMissingFromSteam(missIds, lang, limit) {
     for (let i = 0; i < missIds.length; i += BATCH_SIZE) {
         chunks.push(missIds.slice(i, i + BATCH_SIZE));
     }
-    let steamBatches = 0;
-    for (const chunk of chunks) {
-        const batchResults = await limit(() => fetchAppDetailsBatch(chunk, lang));
-        steamBatches += 1;
+    const batchResultsList = await Promise.all(chunks.map((chunk) => limit(() => fetchAppDetailsBatch(chunk, lang))));
+    let steamBatches = batchResultsList.length;
+    const allStillMiss = [];
+    for (let i = 0; i < chunks.length; i++) {
+        const batchResults = batchResultsList[i];
+        const chunk = chunks[i];
         Object.assign(results, batchResults);
         const got = new Set(Object.keys(batchResults).map(Number));
-        const stillMiss = chunk.filter((id) => !got.has(id));
-        if (stillMiss.length > 0) {
-            await Promise.all(stillMiss.map((id) => limit(async () => {
-                const one = await fetchAppDetailsBatch([id], lang);
-                steamBatches += 1;
-                if (one[id])
-                    results[id] = one[id];
-                return one;
-            })));
-        }
+        allStillMiss.push(...chunk.filter((id) => !got.has(id)));
+    }
+    if (allStillMiss.length > 0) {
+        const retryList = await Promise.all(allStillMiss.map((id) => limit(async () => {
+            const one = await fetchAppDetailsBatch([id], lang);
+            if (one[id])
+                results[id] = one[id];
+            return one;
+        })));
+        steamBatches += retryList.length;
     }
     return { results, steamBatches };
 }
@@ -137,28 +140,28 @@ async function getGamesMeta(appIds, lang = 'en-US') {
     const result = [];
     const missIds = [];
     if (redis) {
-        for (const appId of unique) {
-            try {
-                const raw = await redis.get(`${CACHE_KEY_PREFIX}${appId}`);
-                if (raw) {
-                    try {
-                        const parsed = JSON.parse(raw);
-                        if (parsed?.appId && parsed?.name) {
-                            result.push(parsed);
-                            onCacheHit?.();
-                            continue;
-                        }
-                    }
-                    catch {
-                        // invalid json
+        const keys = unique.map((id) => `${CACHE_KEY_PREFIX}${id}`);
+        const redisAny = redis;
+        const rawList = typeof redisAny.mget === 'function'
+            ? await redisAny.mget(...keys)
+            : await Promise.all(keys.map((k) => redis.get(k)));
+        for (let i = 0; i < unique.length; i++) {
+            const raw = rawList[i];
+            if (raw) {
+                try {
+                    const parsed = JSON.parse(raw);
+                    if (parsed?.appId && parsed?.name) {
+                        result.push(parsed);
+                        onCacheHit?.();
+                        continue;
                     }
                 }
-            }
-            catch {
-                // redis get failed
+                catch {
+                    // invalid json
+                }
             }
             onCacheMiss?.();
-            missIds.push(appId);
+            missIds.push(unique[i]);
         }
     }
     else {
@@ -207,26 +210,27 @@ async function getGamesMetaMapCacheOnly(appIds, _lang = 'en-US') {
         return result;
     }
     let cacheHits = 0;
-    for (const appId of unique) {
-        try {
-            const raw = await redis.get(`${CACHE_KEY_PREFIX}${appId}`);
-            if (raw) {
-                try {
-                    const parsed = JSON.parse(raw);
-                    if (parsed?.appId && parsed?.name) {
-                        result.set(appId, parsed);
-                        cacheHits += 1;
-                        onCacheHit?.();
-                        continue;
-                    }
-                }
-                catch {
-                    // invalid
+    const keys = unique.map((id) => `${CACHE_KEY_PREFIX}${id}`);
+    const redisAny = redis;
+    const rawList = typeof redisAny.mget === 'function'
+        ? await redisAny.mget(...keys)
+        : await Promise.all(keys.map((k) => redis.get(k)));
+    for (let i = 0; i < unique.length; i++) {
+        const appId = unique[i];
+        const raw = rawList[i];
+        if (raw) {
+            try {
+                const parsed = JSON.parse(raw);
+                if (parsed?.appId && parsed?.name) {
+                    result.set(appId, parsed);
+                    cacheHits += 1;
+                    onCacheHit?.();
+                    continue;
                 }
             }
-        }
-        catch {
-            // redis get failed
+            catch {
+                // invalid json
+            }
         }
         onCacheMiss?.();
     }

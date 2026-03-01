@@ -77,6 +77,9 @@ function ensureInit(): void {
   }
 }
 
+const STEAM_HEADER_CDN = (appId: number) =>
+  `https://shared.fastly.steamstatic.com/store_item_assets/steam/apps/${appId}/header.jpg`;
+
 function buildGameMeta(appId: number, data: Record<string, unknown>): GameMeta {
   const id = Number(appId);
   return {
@@ -84,7 +87,7 @@ function buildGameMeta(appId: number, data: Record<string, unknown>): GameMeta {
     appType: String(data.type || ''),
     name: (data.name as string) || `App ${id}`,
     posterImage: `https://cdn.akamai.steamstatic.com/steam/apps/${id}/library_600x900.jpg`,
-    headerImage: (data.header_image as string) || `https://cdn.akamai.steamstatic.com/steam/apps/${id}/header.jpg`,
+    headerImage: (data.header_image as string) || STEAM_HEADER_CDN(id),
     shortDescription: (data.short_description as string) || 'Detailed description is temporarily unavailable for this game.',
     trailerUrl: (() => {
       const m = (data.movies as { mp4?: { max?: string; '480'?: string }; thumbnail?: string }[])?.[0];
@@ -133,25 +136,29 @@ async function fetchMissingFromSteam(
   for (let i = 0; i < missIds.length; i += BATCH_SIZE) {
     chunks.push(missIds.slice(i, i + BATCH_SIZE));
   }
-  let steamBatches = 0;
-  for (const chunk of chunks) {
-    const batchResults = await limit(() => fetchAppDetailsBatch(chunk, lang));
-    steamBatches += 1;
+  const batchResultsList = await Promise.all(
+    chunks.map((chunk) => limit(() => fetchAppDetailsBatch(chunk, lang)))
+  );
+  let steamBatches = batchResultsList.length;
+  const allStillMiss: number[] = [];
+  for (let i = 0; i < chunks.length; i++) {
+    const batchResults = batchResultsList[i];
+    const chunk = chunks[i];
     Object.assign(results, batchResults);
     const got = new Set(Object.keys(batchResults).map(Number));
-    const stillMiss = chunk.filter((id) => !got.has(id));
-    if (stillMiss.length > 0) {
-      await Promise.all(
-        stillMiss.map((id) =>
-          limit(async () => {
-            const one = await fetchAppDetailsBatch([id], lang);
-            steamBatches += 1;
-            if (one[id]) results[id] = one[id];
-            return one;
-          })
-        )
-      );
-    }
+    allStillMiss.push(...chunk.filter((id) => !got.has(id)));
+  }
+  if (allStillMiss.length > 0) {
+    const retryList = await Promise.all(
+      allStillMiss.map((id) =>
+        limit(async () => {
+          const one = await fetchAppDetailsBatch([id], lang);
+          if (one[id]) results[id] = one[id];
+          return one;
+        })
+      )
+    );
+    steamBatches += retryList.length;
   }
   return { results, steamBatches };
 }
@@ -177,26 +184,28 @@ export async function getGamesMeta(appIds: number[], lang: string = 'en-US'): Pr
   const missIds: number[] = [];
 
   if (redis) {
-    for (const appId of unique) {
-      try {
-        const raw = await redis.get(`${CACHE_KEY_PREFIX}${appId}`);
-        if (raw) {
-          try {
-            const parsed = JSON.parse(raw) as GameMeta;
-            if (parsed?.appId && parsed?.name) {
-              result.push(parsed);
-              onCacheHit?.();
-              continue;
-            }
-          } catch {
-            // invalid json
+    const keys = unique.map((id) => `${CACHE_KEY_PREFIX}${id}`);
+    const redisAny = redis as { get: (k: string) => Promise<string | null>; mget?: (...k: string[]) => Promise<(string | null)[]> };
+    const rawList: (string | null)[] =
+      typeof redisAny.mget === 'function'
+        ? await redisAny.mget(...keys)
+        : await Promise.all(keys.map((k) => redis.get(k)));
+    for (let i = 0; i < unique.length; i++) {
+      const raw = rawList[i];
+      if (raw) {
+        try {
+          const parsed = JSON.parse(raw) as GameMeta;
+          if (parsed?.appId && parsed?.name) {
+            result.push(parsed);
+            onCacheHit?.();
+            continue;
           }
+        } catch {
+          // invalid json
         }
-      } catch {
-        // redis get failed
       }
       onCacheMiss?.();
-      missIds.push(appId);
+      missIds.push(unique[i]);
     }
   } else {
     for (const _ of unique) onCacheMiss?.();
@@ -249,24 +258,27 @@ export async function getGamesMetaMapCacheOnly(appIds: number[], _lang: string =
     return result;
   }
   let cacheHits = 0;
-  for (const appId of unique) {
-    try {
-      const raw = await redis.get(`${CACHE_KEY_PREFIX}${appId}`);
-      if (raw) {
-        try {
-          const parsed = JSON.parse(raw) as GameMeta;
-          if (parsed?.appId && parsed?.name) {
-            result.set(appId, parsed);
-            cacheHits += 1;
-            onCacheHit?.();
-            continue;
-          }
-        } catch {
-          // invalid
+  const keys = unique.map((id) => `${CACHE_KEY_PREFIX}${id}`);
+  const redisAny = redis as { get: (k: string) => Promise<string | null>; mget?: (...k: string[]) => Promise<(string | null)[]> };
+  const rawList: (string | null)[] =
+    typeof redisAny.mget === 'function'
+      ? await redisAny.mget(...keys)
+      : await Promise.all(keys.map((k) => redis.get(k)));
+  for (let i = 0; i < unique.length; i++) {
+    const appId = unique[i];
+    const raw = rawList[i];
+    if (raw) {
+      try {
+        const parsed = JSON.parse(raw) as GameMeta;
+        if (parsed?.appId && parsed?.name) {
+          result.set(appId, parsed);
+          cacheHits += 1;
+          onCacheHit?.();
+          continue;
         }
+      } catch {
+        // invalid json
       }
-    } catch {
-      // redis get failed
     }
     onCacheMiss?.();
   }

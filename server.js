@@ -143,11 +143,22 @@ try {
 function createUpstashRedisAdapter(upstash) {
   return {
     get: (key) => upstash.get(key),
+    mget: (...keys) => (keys.length ? upstash.mget(...keys) : Promise.resolve([])),
     set: (key, value, opts) => {
       const options = {};
       if (opts && opts.EX != null) options.ex = opts.EX;
       if (opts && opts.NX) options.nx = true;
       return upstash.set(key, value, Object.keys(options).length ? options : undefined);
+    },
+    pipeline: () => {
+      const p = upstash.pipeline();
+      return {
+        set: (key, value, opts) => {
+          const options = opts && opts.EX != null ? { ex: opts.EX } : undefined;
+          p.set(key, value, options);
+        },
+        exec: () => p.exec(),
+      };
     },
     del: (key) => upstash.del(key),
     sAdd: (key, ...args) => {
@@ -1103,7 +1114,7 @@ async function getCandidateGamesForFortune(steamId, lang = 'zh-CN') {
   let ids = (fallbackIds || []).map((e) => Number(e)).filter((id) => Number.isInteger(id) && id > 0);
   if (ids.length === 0) ids = [...TRENDING_FALLBACK_POOL].slice(0, 15);
   const unique = [...new Set(ids)].slice(0, 15);
-  const metaMap = await storeService.getGamesMetaMap(unique, lang);
+  const metaMap = await getGamesMetaMapWithSteamSpyFirst(unique, lang);
   const candidates = [];
   for (const appId of unique) {
     const details = metaMap.get(Number(appId));
@@ -1465,19 +1476,30 @@ async function triggerSteamSpySyncOnFirstVisit() {
     if (!setOk) return;
     const steamSpyBaseUrl = (process.env.STEAMSPY_BASE_URL || 'https://steamspy.com').replace(/\/$/, '');
     const steamSpyCacheTtl = Number(process.env.STEAMSPY_CACHE_TTL || 7 * 24 * 3600);
-    const steamSpyMaxPages = Math.max(1, Math.min(100, Number(process.env.STEAMSPY_SYNC_MAX_PAGES) || 20));
-    const steamSpySkipHours = Math.max(0, Number(process.env.STEAMSPY_SKIP_PAGE_WITHIN_HOURS) ?? 24);
+    const steamSpyHeaders = {
+      'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
+      Accept: 'application/json, text/javascript, */*; q=0.01',
+      'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.8',
+      Referer: 'https://steamspy.com/',
+      'X-Requested-With': 'XMLHttpRequest',
+    };
+    const fetchWithStatus = async (url) => {
+      const res = await fetch(url, { signal: AbortSignal.timeout(30000), headers: steamSpyHeaders });
+      const text = await res.text();
+      let data = null;
+      try {
+        data = text.trim().startsWith('{') ? JSON.parse(text) : null;
+      } catch (_) {}
+      const tooMany = /too many connections|connection failed/i.test(text);
+      if (tooMany && !data) return { status: 503, data: null };
+      if (res.ok && data != null) metricsService.recordSteamSpyCall();
+      return { status: res.status, data };
+    };
     await runSyncSteamSpy({
       redis: redisClient,
-      fetchJson: (url) =>
-        fetchJson(url).then((data) => {
-          metricsService.recordSteamSpyCall();
-          return data;
-        }),
+      fetchWithStatus,
       steamSpyBaseUrl,
       steamSpyCacheTtlSec: steamSpyCacheTtl,
-      maxPages: steamSpyMaxPages,
-      skipPageWithinHours: steamSpySkipHours,
     });
     console.log('[steamspy-trigger] sync-steamspy completed after first visit');
   } catch (err) {
@@ -1656,7 +1678,7 @@ async function getGameDetails(appId, lang = 'en-US') {
     appType: String(data.type || ''),
     name: data.name || `App ${appId}`,
     posterImage: `https://cdn.akamai.steamstatic.com/steam/apps/${appId}/library_600x900.jpg`,
-    headerImage: data.header_image || `https://cdn.akamai.steamstatic.com/steam/apps/${appId}/header.jpg`,
+    headerImage: data.header_image || `https://shared.fastly.steamstatic.com/store_item_assets/steam/apps/${appId}/header.jpg`,
     shortDescription: data.short_description || 'Detailed description is temporarily unavailable for this game.',
     trailerUrl: data.movies?.[0]?.mp4?.max || data.movies?.[0]?.mp4?.["480"] || '',
     trailerPoster: data.movies?.[0]?.thumbnail || '',
@@ -2247,11 +2269,15 @@ function buildBacklogFromOwned(profile, forbiddenSet, lang = 'en-US') {
 
 const STEAM_META_KEY_PREFIX = 'steam_meta:';
 
-/** 仅从 Redis 读取 steam_meta:{appid}，不调用 Steam API。用于统一评分排序。 */
+/** 仅从 Redis 读取 steam_meta:{appid}，不调用 Steam API。批量用 mget 一次取回，无 mget 时退化为 Promise.all(get)。 */
 async function getSteamSpyMetaFromRedis(redis, appIds) {
   if (!redis || !appIds || appIds.length === 0) return new Map();
   const unique = [...new Set(appIds.map((id) => Number(id)).filter((id) => Number.isInteger(id) && id > 0))];
-  const results = await Promise.all(unique.map((id) => redis.get(STEAM_META_KEY_PREFIX + id)));
+  const keys = unique.map((id) => STEAM_META_KEY_PREFIX + id);
+  const results =
+    redis.mget && typeof redis.mget === 'function'
+      ? await redis.mget(...keys)
+      : await Promise.all(keys.map((k) => redis.get(k)));
   const map = new Map();
   for (let i = 0; i < unique.length; i++) {
     const raw = results[i];
@@ -2260,6 +2286,117 @@ async function getSteamSpyMetaFromRedis(redis, appIds) {
       const meta = typeof raw === 'string' ? JSON.parse(raw) : raw;
       if (meta && Number.isInteger(Number(meta.appid))) map.set(unique[i], meta);
     } catch (_) {}
+  }
+  return map;
+}
+
+const STEAM_HEADER_CDN = (appId) =>
+  `https://shared.fastly.steamstatic.com/store_item_assets/steam/apps/${appId}/header.jpg`;
+
+/** 用 steam_meta（SteamSpy 同步数据）拼出前端期望的 GameMeta 形状；无 header_image 时用 Steam CDN 公式。 */
+function buildGameMetaFromSteamSpy(appId, spyMeta) {
+  const id = Number(appId);
+  const name = (spyMeta?.name && !/^App\s+\d+$/i.test(String(spyMeta.name)))
+    ? String(spyMeta.name).trim()
+    : `App ${id}`;
+  const pos = Number(spyMeta?.positive) || 0;
+  const neg = Number(spyMeta?.negative) || 0;
+  const total = pos + neg;
+  const positiveRate = total > 0 ? `${Math.round((pos / total) * 100)}%` : 'N/A';
+  const ccu = Number(spyMeta?.ccu) || 0;
+  const currentPlayers = ccu > 0 ? `${ccu.toLocaleString()} online` : 'N/A';
+  return {
+    appId: id,
+    appType: 'game',
+    name,
+    posterImage: `https://cdn.akamai.steamstatic.com/steam/apps/${id}/library_600x900.jpg`,
+    headerImage: STEAM_HEADER_CDN(id),
+    shortDescription: 'Detailed description is temporarily unavailable for this game.',
+    trailerUrl: '',
+    trailerPoster: '',
+    genres: [],
+    releaseDate: 'Unknown',
+    isFree: false,
+    price: 'N/A',
+    positiveRate,
+    currentPlayers,
+    steamUrl: `https://store.steampowered.com/app/${id}`,
+  };
+}
+
+/** 仅用 steam_meta（单次 mget），不请求 Store。用于 preflight 快速响应；缺数据的用最小卡片（name + CDN 图）。 */
+async function getGamesMetaMapSteamSpyOnly(appIds) {
+  const unique = [...new Set((appIds || []).map((id) => Number(id)).filter((id) => Number.isInteger(id) && id > 0))];
+  if (unique.length === 0) return new Map();
+  const map = new Map();
+  const redis = redisClient && redisHealthy ? redisClient : null;
+  if (redis) {
+    const steamSpyMeta = await getSteamSpyMetaFromRedis(redis, unique);
+    for (const id of unique) {
+      const spy = steamSpyMeta.get(id);
+      if (spy) map.set(id, buildGameMetaFromSteamSpy(id, spy));
+      else
+        map.set(id, {
+          appId: id,
+          appType: 'game',
+          name: `App ${id}`,
+          posterImage: `https://cdn.akamai.steamstatic.com/steam/apps/${id}/library_600x900.jpg`,
+          headerImage: STEAM_HEADER_CDN(id),
+          shortDescription: 'Detailed description is temporarily unavailable for this game.',
+          trailerUrl: '',
+          trailerPoster: '',
+          genres: [],
+          releaseDate: 'Unknown',
+          isFree: false,
+          price: 'N/A',
+          positiveRate: 'N/A',
+          currentPlayers: 'N/A',
+          steamUrl: `https://store.steampowered.com/app/${id}`,
+        });
+    }
+  } else {
+    for (const id of unique) {
+      map.set(id, {
+        appId: id,
+        appType: 'game',
+        name: `App ${id}`,
+        posterImage: `https://cdn.akamai.steamstatic.com/steam/apps/${id}/library_600x900.jpg`,
+        headerImage: STEAM_HEADER_CDN(id),
+        shortDescription: 'Detailed description is temporarily unavailable for this game.',
+        trailerUrl: '',
+        trailerPoster: '',
+        genres: [],
+        releaseDate: 'Unknown',
+        isFree: false,
+        price: 'N/A',
+        positiveRate: 'N/A',
+        currentPlayers: 'N/A',
+        steamUrl: `https://store.steampowered.com/app/${id}`,
+      });
+    }
+  }
+  return map;
+}
+
+/** 先查 steam_meta:{appid} 作为 base，仅对没有 steam_meta 的 appId 请求 Steam Store API。 */
+async function getGamesMetaMapWithSteamSpyFirst(appIds, lang) {
+  const unique = [...new Set((appIds || []).map((id) => Number(id)).filter((id) => Number.isInteger(id) && id > 0))];
+  if (unique.length === 0) return new Map();
+  const map = new Map();
+  const redis = redisClient && redisHealthy ? redisClient : null;
+  if (redis) {
+    const steamSpyMeta = await getSteamSpyMetaFromRedis(redis, unique);
+    for (const id of unique) {
+      const spy = steamSpyMeta.get(id);
+      if (spy) map.set(id, buildGameMetaFromSteamSpy(id, spy));
+    }
+  }
+  const missIds = unique.filter((id) => !map.has(id));
+  if (missIds.length > 0) {
+    const storeMap = await storeService.getGamesMetaMap(missIds, lang);
+    storeMap.forEach((meta, id) => {
+      if (meta && meta.name && !/^App\s+\d+$/i.test(meta.name)) map.set(id, meta);
+    });
   }
   return map;
 }
@@ -2530,7 +2667,7 @@ function ensureScenarioMinimums(scenarios, forbiddenAppIds, lang = 'en-US') {
 /** 从已拉取的 store 元数据中选第一个可用池子游戏（供 repair 使用）；若未传 metaMap 则走 storeService 批量拉取。 */
 async function resolvePoolGame(forbiddenSet, lang = 'en-US', metaMap = null) {
   const candidateIds = DIVERSITY_APP_POOL.filter((id) => !forbiddenSet.has(Number(id)));
-  const map = metaMap != null ? metaMap : await storeService.getGamesMetaMap(candidateIds, lang);
+  const map = metaMap != null ? metaMap : await getGamesMetaMapWithSteamSpyFirst(candidateIds, lang);
   for (const appId of candidateIds) {
     const details = map.get(Number(appId));
     if (!details) continue;
@@ -2650,7 +2787,7 @@ async function repairEmptyNonBacklogLanes(scenarios, forbiddenAppIds, lang = 'en
   });
 
   const poolCandidateIds = DIVERSITY_APP_POOL.filter((id) => !forbidden.has(Number(id)) && !used.has(Number(id)));
-  const poolMeta = poolCandidateIds.length > 0 ? await storeService.getGamesMetaMap(poolCandidateIds, lang) : new Map();
+  const poolMeta = poolCandidateIds.length > 0 ? await getGamesMetaMapWithSteamSpyFirst(poolCandidateIds, lang) : new Map();
 
   const out = {};
   for (const [key, lane] of Object.entries(scenarios || {})) {
@@ -2743,13 +2880,17 @@ async function enrichScenariosWithStoreData(scenarios, forbiddenAppIds = [], lan
   }
   const allAppIds = [...prefetchIds];
   alternatePool.forEach((id) => allAppIds.push(id));
-  const prefetchedDetails = cacheOnly
-    ? await storeService.getGamesMetaMapCacheOnly(allAppIds, lang)
-    : await storeService.getGamesMetaMap(allAppIds, lang);
+  const preflight = options.preflight === true;
+  const prefetchedDetails =
+    preflight
+      ? await getGamesMetaMapSteamSpyOnly(allAppIds)
+      : cacheOnly
+        ? await storeService.getGamesMetaMapCacheOnly(allAppIds, lang)
+        : await getGamesMetaMapWithSteamSpyFirst(allAppIds, lang);
 
   const missingFromStore = [...prefetchIds].filter((id) => !prefetchedDetails.get(id));
   let steamSpyMeta = new Map();
-  if (missingFromStore.length > 0 && redisClient) {
+  if (missingFromStore.length > 0 && redisClient && !preflight) {
     steamSpyMeta = await getSteamSpyMetaFromRedis(redisClient, missingFromStore);
   }
 
@@ -2757,12 +2898,14 @@ async function enrichScenariosWithStoreData(scenarios, forbiddenAppIds = [], lan
     const releaseDate = details.releaseDate || '';
     const newRelease = isNewRelease(releaseDate);
     const reason = useNewReleaseReason && newRelease ? buildNewReleaseReason(lang) : (g.reason || '');
+    const headerUrl = details.headerImage || STEAM_HEADER_CDN(details.appId);
+    const mediaUrl = details.posterImage || details.headerImage || headerUrl;
     return {
       appId: details.appId,
       name: details.name,
       mediaType: 'image',
-      media: details.posterImage || details.headerImage,
-      mediaFallback: details.headerImage,
+      media: mediaUrl,
+      mediaFallback: headerUrl,
       positiveRate: details.positiveRate,
       players: details.currentPlayers,
       price: details.price,
@@ -2806,8 +2949,6 @@ async function enrichScenariosWithStoreData(scenarios, forbiddenAppIds = [], lan
         const substituted = tryAlternateForSlot(g, key);
         if (substituted) {
           games.push(substituted);
-        } else if (cacheOnly) {
-          // fallback 阶段：Redis 无 store meta 则直接跳过该游戏，不请求 Steam、不展示占位
         } else {
           used.add(appId);
           const spyMeta = steamSpyMeta.get(appId);
@@ -2823,9 +2964,9 @@ async function enrichScenariosWithStoreData(scenarios, forbiddenAppIds = [], lan
             name,
             mediaType: 'image',
             media: `https://cdn.akamai.steamstatic.com/steam/apps/${appId}/library_600x900.jpg`,
-            mediaFallback: `https://cdn.akamai.steamstatic.com/steam/apps/${appId}/header.jpg`,
+            mediaFallback: STEAM_HEADER_CDN(appId),
             positiveRate,
-            players: '',
+            players: spyMeta && Number(spyMeta.ccu) > 0 ? `${Number(spyMeta.ccu).toLocaleString()} online` : '',
             price: '',
             releaseDate: '',
             isNewRelease: false,
@@ -3016,19 +3157,30 @@ const server = http.createServer(async (req, res) => {
       try {
         const steamSpyBaseUrl = (process.env.STEAMSPY_BASE_URL || 'https://steamspy.com').replace(/\/$/, '');
         const steamSpyCacheTtl = Number(process.env.STEAMSPY_CACHE_TTL || 7 * 24 * 3600);
-        const steamSpyMaxPages = Math.max(1, Math.min(100, Number(process.env.STEAMSPY_SYNC_MAX_PAGES) || 20));
-        const steamSpySkipHours = Math.max(0, Number(process.env.STEAMSPY_SKIP_PAGE_WITHIN_HOURS) ?? 24);
+        const steamSpyHeaders = {
+          'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
+          Accept: 'application/json, text/javascript, */*; q=0.01',
+          'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.8',
+          Referer: 'https://steamspy.com/',
+          'X-Requested-With': 'XMLHttpRequest',
+        };
+        const fetchWithStatus = async (url) => {
+          const res = await fetch(url, { signal: AbortSignal.timeout(30000), headers: steamSpyHeaders });
+          const text = await res.text();
+          let data = null;
+          try {
+            data = text.trim().startsWith('{') ? JSON.parse(text) : null;
+          } catch (_) {}
+          const tooMany = /too many connections|connection failed/i.test(text);
+          if (tooMany && !data) return { status: 503, data: null };
+          if (res.ok && data != null) metricsService.recordSteamSpyCall();
+          return { status: res.status, data };
+        };
         const result = await runSyncSteamSpy({
           redis: redisClient,
-          fetchJson: (url) =>
-            fetchJson(url).then((data) => {
-              metricsService.recordSteamSpyCall();
-              return data;
-            }),
+          fetchWithStatus,
           steamSpyBaseUrl,
           steamSpyCacheTtlSec: steamSpyCacheTtl,
-          maxPages: steamSpyMaxPages,
-          skipPageWithinHours: steamSpySkipHours,
         });
         sendJson(res, 200, { success: true, message: 'SteamSpy sync completed', ...result });
       } catch (err) {
@@ -3326,7 +3478,7 @@ const server = http.createServer(async (req, res) => {
         repairedNonOwned,
         [...recentRecommendedAppIds, ...mergedExcludedSessionAppIds],
         lang,
-        { alternatePool: [...TRENDING_FALLBACK_POOL], cacheOnly: usedFallback }
+        { alternatePool: [...TRENDING_FALLBACK_POOL], cacheOnly: usedFallback, preflight: true }
       );
       if (usedFallback) {
         console.log('[ai-analysis] fallback 阶段是否触发 Steam 请求: 否 (steamBatches=0，仅读本地缓存)');
@@ -3384,7 +3536,7 @@ const server = http.createServer(async (req, res) => {
                   name: `App ${appId}`,
                   mediaType: 'image',
                   media: `https://cdn.akamai.steamstatic.com/steam/apps/${appId}/library_600x900.jpg`,
-                  mediaFallback: `https://cdn.akamai.steamstatic.com/steam/apps/${appId}/header.jpg`,
+                  mediaFallback: STEAM_HEADER_CDN(appId),
                   positiveRate: '',
                   players: '',
                   price: '',
@@ -3424,7 +3576,7 @@ const server = http.createServer(async (req, res) => {
                     name: `App ${appId}`,
                     mediaType: 'image',
                     media: `https://cdn.akamai.steamstatic.com/steam/apps/${appId}/library_600x900.jpg`,
-                    mediaFallback: `https://cdn.akamai.steamstatic.com/steam/apps/${appId}/header.jpg`,
+                    mediaFallback: STEAM_HEADER_CDN(appId),
                     positiveRate: '',
                     players: '',
                     price: '',
@@ -3521,7 +3673,7 @@ const server = http.createServer(async (req, res) => {
           return;
         }
         const { fortune, appId } = await callAiForDailyFortune(card.cardName, activityDiff, candidates, lang);
-        const metaMap = await storeService.getGamesMetaMap([appId], lang);
+        const metaMap = await getGamesMetaMapWithSteamSpyFirst([appId], lang);
         const details = metaMap.get(Number(appId));
         if (!details || !details.name || /^App\s+\d+$/i.test(details.name)) {
           throw new Error('Daily fortune game details unavailable');
@@ -3563,7 +3715,7 @@ const server = http.createServer(async (req, res) => {
         .filter((id) => Number.isInteger(id) && id > 0)
         .slice(0, 20);
       if (appIds.length === 0) return sendJson(res, 400, { error: 'Missing or invalid appIds (comma-separated, max 20).' });
-      const metaMap = await storeService.getGamesMetaMap(appIds, lang);
+      const metaMap = await getGamesMetaMapWithSteamSpyFirst(appIds, lang);
       const results = {};
       metaMap.forEach((d, id) => {
         if (d && d.name && !/^App\s+\d+$/i.test(d.name)) results[String(id)] = d;
@@ -3576,12 +3728,19 @@ const server = http.createServer(async (req, res) => {
       const appId = pathname.replace('/api/game/', '').trim();
       const lang = normalizeLang(requestUrl.searchParams.get('lang') || 'en-US');
       if (!/^\d+$/.test(appId)) return sendJson(res, 400, { error: 'Invalid app ID.' });
-
-      const metaMap = await storeService.getGamesMetaMap([Number(appId)], lang);
-      const details = metaMap.get(Number(appId)) || ({
-        appId: Number(appId),
-        name: `App ${appId}`,
-        headerImage: `https://cdn.akamai.steamstatic.com/steam/apps/${appId}/header.jpg`,
+      const id = Number(appId);
+      const metaMap = await getGamesMetaMapWithSteamSpyFirst([id], lang);
+      let details = metaMap.get(id);
+      if (!details && redisClient && redisHealthy) {
+        const steamSpyMeta = await getSteamSpyMetaFromRedis(redisClient, [id]);
+        const spy = steamSpyMeta.get(id);
+        if (spy) details = buildGameMetaFromSteamSpy(id, spy);
+      }
+      const fallback = details || {
+        appId: id,
+        name: `App ${id}`,
+        posterImage: `https://cdn.akamai.steamstatic.com/steam/apps/${id}/library_600x900.jpg`,
+        headerImage: STEAM_HEADER_CDN(id),
         shortDescription: 'Detailed description is temporarily unavailable for this game.',
         trailerUrl: '',
         trailerPoster: '',
@@ -3591,9 +3750,9 @@ const server = http.createServer(async (req, res) => {
         price: 'N/A',
         positiveRate: 'N/A',
         currentPlayers: 'N/A',
-        steamUrl: `https://store.steampowered.com/app/${appId}`,
-      });
-      sendJson(res, 200, details);
+        steamUrl: `https://store.steampowered.com/app/${id}`,
+      };
+      sendJson(res, 200, fallback);
       return;
     }
 

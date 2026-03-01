@@ -1,10 +1,17 @@
 /**
  * SteamSpy 数据同步：供 GET /api/cron/sync-steamspy 与 scripts/syncSteamSpy.ts 调用。
- * 支持 maxPages、断点续传（24h 内已同步页跳过）、进度日志。不修改推荐逻辑。
+ * 串行执行、每页间隔 1s、429/503/连接失败指数退避、每日 top100×3 + 2 页 all（10 天建库）。
  */
 
 const STEAM_META_KEY_PREFIX = 'steam_meta:';
-const PAGE_SYNC_KEY_PREFIX = 'steam_spy_sync:page:';
+const LAST_SYNC_TIMESTAMP_KEY = 'steamspy:last_sync_timestamp';
+const ALL_NEXT_PAGE_KEY = 'steamspy:all:next_page';
+const IDEMPOTENCY_TTL_SEC = 24 * 3600; // 24h 内不重复同步
+const PAGE_INTERVAL_MS = 2000; // 每页/每次请求间隔 2s，减轻 SteamSpy "Too many connections"
+const BACKOFF_MS = [2000, 4000, 8000]; // 指数退避：2s → 4s → 8s
+const MAX_RETRIES = 3;
+const ALL_PAGES_TOTAL = 20; // all 共 20 页，每天 2 页，10 天建库
+const ALL_PAGES_PER_RUN = 2;
 
 interface SteamSpyRawItem {
   appid?: number;
@@ -31,18 +38,32 @@ interface SteamMetaValue {
   last_sync: number;
 }
 
+export interface SyncSteamSpyResult {
+  total_pages: number;
+  total_games: number;
+  successful_batches: number;
+  failed_batches: number;
+  duration_ms: number;
+  skipped?: boolean;
+  totalSync?: number;
+  elapsedSec?: number;
+}
+
 export interface SyncSteamSpyConfig {
   redis: {
     get?: (key: string) => Promise<string | null>;
     set: (key: string, value: string, opts?: { EX?: number }) => Promise<unknown>;
+    pipeline?: () => {
+      set: (key: string, value: string, opts?: { EX?: number }) => void;
+      exec: () => Promise<unknown[]>;
+    };
   };
-  fetchJson: (url: string) => Promise<unknown>;
+  /** 兼容旧调用；与 fetchWithStatus 二选一，无 fetchWithStatus 时用 fetchJson 包装（无法区分 429/503） */
+  fetchJson?: (url: string) => Promise<unknown>;
+  /** 推荐：返回 status 与 body，用于 429/503 重试 */
+  fetchWithStatus?: (url: string) => Promise<{ status: number; data: unknown }>;
   steamSpyBaseUrl?: string;
   steamSpyCacheTtlSec?: number;
-  /** 最大同步页数（page 0 到 maxPages-1），默认 20 */
-  maxPages?: number;
-  /** 若某页在此小时数内已同步则跳过（断点续传），0 表示不跳过，默认 24 */
-  skipPageWithinHours?: number;
 }
 
 function toSteamMeta(raw: SteamSpyRawItem): SteamMetaValue | null {
@@ -66,73 +87,172 @@ function toSteamMeta(raw: SteamSpyRawItem): SteamMetaValue | null {
   };
 }
 
-export async function runSyncSteamSpy(config: SyncSteamSpyConfig): Promise<{ totalSync: number; success: number; fail: number; elapsedSec: number }> {
+function parseSteamSpyData(data: unknown): SteamSpyRawItem[] {
+  if (!data || typeof data !== 'object') return [];
+  const obj = data as Record<string, SteamSpyRawItem>;
+  return Object.values(obj);
+}
+
+export async function runSyncSteamSpy(config: SyncSteamSpyConfig): Promise<SyncSteamSpyResult> {
   const started = Date.now();
   const baseUrl = (config.steamSpyBaseUrl || 'https://steamspy.com').replace(/\/$/, '');
   const ttlSec = config.steamSpyCacheTtlSec ?? 7 * 24 * 3600;
-  const maxPages = Math.max(1, Math.min(100, config.maxPages ?? 20));
-  const skipHours = config.skipPageWithinHours ?? 24;
-  const fetchJson = config.fetchJson;
   const redis = config.redis;
   const redisGet = redis.get && typeof redis.get === 'function' ? redis.get.bind(redis) : null;
+  const pipelineFn = redis.pipeline && typeof redis.pipeline === 'function' ? redis.pipeline.bind(redis) : null;
 
-  let totalSync = 0;
-  let success = 0;
-  let fail = 0;
+  const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
-  for (let page = 0; page < maxPages; page++) {
-    const pageKey = `${PAGE_SYNC_KEY_PREFIX}${page}`;
-    if (skipHours > 0 && redisGet) {
-      try {
-        const existing = await redisGet(pageKey);
-        if (existing != null && String(existing).trim() !== '') {
-          console.log(`[syncSteamSpy] page ${page + 1} / ${maxPages} 已跳过（${skipHours}h 内已同步），当前累计 ${totalSync} 条`);
-          continue;
-        }
-      } catch (_) {
-        /* 检查失败则照常拉取 */
-      }
-    }
-
-    const url = `${baseUrl}/api.php?request=all&page=${page}`;
-    let data: Record<string, SteamSpyRawItem>;
+  const doFetch = config.fetchWithStatus ?? (async (url: string) => {
     try {
-      data = (await fetchJson(url)) as Record<string, SteamSpyRawItem>;
-    } catch (err) {
-      console.warn(`[syncSteamSpy] page ${page + 1} / ${maxPages} 请求失败:`, (err as Error)?.message);
-      continue;
+      const data = config.fetchJson ? await config.fetchJson(url) : null;
+      return { status: 200, data };
+    } catch {
+      return { status: 0, data: null };
     }
-    const items = data && typeof data === 'object' ? (Object.values(data) as SteamSpyRawItem[]) : [];
-    const pageSuccess: number[] = [];
-    const pageFail: number[] = [];
-    for (const raw of items) {
-      const meta = toSteamMeta(raw);
-      if (!meta) {
-        pageFail.push(1);
-        continue;
-      }
-      try {
-        await redis.set(`${STEAM_META_KEY_PREFIX}${meta.appid}`, JSON.stringify(meta), { EX: ttlSec });
-        pageSuccess.push(1);
-      } catch {
-        pageFail.push(1);
-      }
-    }
-    const pageOk = pageSuccess.length;
-    const pageKo = pageFail.length;
-    success += pageOk;
-    fail += pageKo;
-    totalSync += pageOk + pageKo;
-    console.log(`[syncSteamSpy] page ${page + 1} / ${maxPages}，当前累计 ${totalSync} 条`);
+  });
 
-    if (skipHours > 0) {
-      try {
-        await redis.set(pageKey, String(Date.now()), { EX: skipHours * 3600 });
-      } catch (_) {}
+  // 幂等保护：24h 内已同步则直接返回
+  if (redisGet) {
+    try {
+      const lastSync = await redisGet(LAST_SYNC_TIMESTAMP_KEY);
+      if (lastSync != null && String(lastSync).trim() !== '') {
+        const duration_ms = Math.round(Date.now() - started);
+        const result: SyncSteamSpyResult = {
+          total_pages: 0,
+          total_games: 0,
+          successful_batches: 0,
+          failed_batches: 0,
+          duration_ms,
+          skipped: true,
+        };
+        console.log('[syncSteamSpy] skipped (synced within 24h)', JSON.stringify({ total_pages: 0, total_games: 0, successful_batches: 0, failed_batches: 0, duration_ms }));
+        return result;
+      }
+    } catch (_) {
+      /* 检查失败则继续执行 */
     }
   }
 
-  const elapsedSec = (Date.now() - started) / 1000;
-  console.log(`[syncSteamSpy] Done. 本次同步数量=${totalSync} 成功=${success} 失败=${fail} 耗时=${elapsedSec.toFixed(2)}s`);
-  return { totalSync, success, fail, elapsedSec };
+  let total_games = 0;
+  let successful_batches = 0;
+  let failed_batches = 0;
+  let total_requests = 0;
+
+  const writeBatch = async (label: string, items: SteamSpyRawItem[]): Promise<boolean> => {
+    const entries: { key: string; value: string }[] = [];
+    for (const raw of items) {
+      const meta = toSteamMeta(raw);
+      if (!meta) continue;
+      entries.push({ key: `${STEAM_META_KEY_PREFIX}${meta.appid}`, value: JSON.stringify(meta) });
+    }
+    if (entries.length === 0) return true;
+    if (pipelineFn) {
+      try {
+        const pipe = pipelineFn();
+        for (const { key, value } of entries) pipe.set(key, value, { EX: ttlSec });
+        await pipe.exec();
+        total_games += entries.length;
+        return true;
+      } catch (err) {
+        console.warn(`[syncSteamSpy] ${label} pipeline.exec 失败:`, (err as Error)?.message ?? err);
+        return false;
+      }
+    }
+    let ok = 0;
+    for (const { key, value } of entries) {
+      try {
+        await redis.set(key, value, { EX: ttlSec });
+        ok += 1;
+      } catch (_) {}
+    }
+    total_games += ok;
+    return true;
+  };
+
+  const fetchWithBackoff = async (url: string, label: string): Promise<SteamSpyRawItem[] | null> => {
+    for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
+      const res = await doFetch(url);
+      const status = res.status;
+      const isRetryable = status === 429 || status === 503 || status === 500 || status === 0;
+      if (status === 200 && res.data != null) {
+        return parseSteamSpyData(res.data);
+      }
+      if (isRetryable && attempt < MAX_RETRIES) {
+        const delay = BACKOFF_MS[Math.min(attempt, BACKOFF_MS.length - 1)];
+        console.warn(`[syncSteamSpy] ${label} status=${status}，${delay / 1000}s 后重试 (${attempt + 1}/${MAX_RETRIES})`);
+        await sleep(delay);
+      } else {
+        console.warn(`[syncSteamSpy] ${label} 请求失败 status=${status}`);
+        return null;
+      }
+    }
+    return null;
+  };
+
+  const topEndpoints: { name: string; request: string }[] = [
+    { name: 'top100in2weeks', request: 'top100in2weeks' },
+    { name: 'top100forever', request: 'top100forever' },
+    { name: 'top100owned', request: 'top100owned' },
+  ];
+
+  for (const { name, request } of topEndpoints) {
+    const url = `${baseUrl}/api.php?request=${request}`;
+    const items = await fetchWithBackoff(url, name);
+    total_requests += 1;
+    if (items && items.length > 0) {
+      const ok = await writeBatch(name, items);
+      if (ok) successful_batches += 1;
+      else failed_batches += 1;
+    }
+    await sleep(PAGE_INTERVAL_MS);
+  }
+
+  let nextPage = 0;
+  if (redisGet) {
+    try {
+      const v = await redisGet(ALL_NEXT_PAGE_KEY);
+      if (v != null && v.trim() !== '') nextPage = Math.max(0, Math.min(ALL_PAGES_TOTAL - 1, parseInt(v, 10) || 0));
+    } catch (_) {}
+  }
+
+  for (let i = 0; i < ALL_PAGES_PER_RUN; i++) {
+    const page = nextPage + i;
+    if (page >= ALL_PAGES_TOTAL) break;
+    const url = `${baseUrl}/api.php?request=all&page=${page}`;
+    const items = await fetchWithBackoff(url, `all&page=${page}`);
+    total_requests += 1;
+    if (items && items.length > 0) {
+      const ok = await writeBatch(`all page ${page}`, items);
+      if (ok) successful_batches += 1;
+      else failed_batches += 1;
+    }
+    await sleep(PAGE_INTERVAL_MS);
+  }
+
+  const newNextPage = Math.min(ALL_PAGES_TOTAL, nextPage + ALL_PAGES_PER_RUN);
+  if (redis.set) {
+    try {
+      await redis.set(ALL_NEXT_PAGE_KEY, String(newNextPage), { EX: 30 * 24 * 3600 });
+    } catch (_) {}
+  }
+
+  if (successful_batches > 0 && redis.set) {
+    try {
+      await redis.set(LAST_SYNC_TIMESTAMP_KEY, String(Math.floor(Date.now() / 1000)), { EX: IDEMPOTENCY_TTL_SEC });
+    } catch (_) {}
+  }
+
+  const duration_ms = Math.round(Date.now() - started);
+  const result: SyncSteamSpyResult = {
+    total_pages: total_requests,
+    total_games,
+    successful_batches,
+    failed_batches,
+    duration_ms,
+    totalSync: total_games,
+    elapsedSec: duration_ms / 1000,
+  };
+  console.log('[syncSteamSpy]', JSON.stringify({ total_pages: result.total_pages, total_games: result.total_games, successful_batches: result.successful_batches, failed_batches: result.failed_batches, duration_ms: result.duration_ms, all_next_page: newNextPage }));
+  return result;
 }

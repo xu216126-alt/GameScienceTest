@@ -1,7 +1,7 @@
 # SteamSense AI - Progress Handoff (2026-03-01)
 
 ## 1. Current Status
-The project is in a **working but network-sensitive** state with a multi-step UI flow. The UI is **Chinese-only** (no language toggle). AI prompts and API continue to support `lang`; frontend always sends `zh-CN`. **Vercel 部署**：静态资源已改为通过 `public/` 目录由 Vercel 静态构建提供，首页与静态文件不再经 serverless 函数，避免出现 `{"error":"Not found"}`；推送 Git 后自动部署。**数据源说明**：游戏详情（名称、价格、海报、好评率等）来自 Steam 商店 API（非公开、易限流）；在线人数来自 Steam Web API。兜底池可来自 Steam 商店新品搜索 + SteamSpy；若 SteamSpy 不可用，实际降级主要依赖本地缓存、`fallback_games.json` 与代码内硬编码池（如 `TRENDING_FALLBACK_POOL`）。**Store 数据层**：已引入独立模块 `storeService.js`，负责批量请求 Steam appdetails、Redis 缓存与并发限制，单次推荐流程最多 1–2 次 Steam Store 批量请求，已缓存游戏不再请求 Steam，限流风险显著下降（见 §2.27）。**Nightly 同步**：已增加 `GET /api/cron/sync-steamspy` 与 `services/syncSteamSpy.ts`（SteamSpy 数据写入 `steam_meta:{appid}`），支持 maxPages（默认 20 页）、断点续传（24h 内已同步页跳过）、进度日志；预留扩展接口 `syncStoreMeta(appIds)`（见 §2.28）。**统一评分**：`services/scoreService.ts` 基于本地 SteamSpy 数据计算 0–100 分，推荐候选池与场景内游戏按分数排序，不依赖 Steam 排序（见 §2.29）。**API 监控**：`services/metricsService.ts` 统计 Steam Store / SteamSpy 调用与缓存命中率，`GET /api/metrics` 返回当日统计，每日自动重置（见 §2.30）。
+The project is in a **working but network-sensitive** state with a multi-step UI flow. The UI is **Chinese-only** (no language toggle). AI prompts and API continue to support `lang`; frontend always sends `zh-CN`. **Vercel 部署**：静态资源已改为通过 `public/` 目录由 Vercel 静态构建提供，首页与静态文件不再经 serverless 函数，避免出现 `{"error":"Not found"}`；推送 Git 后自动部署。**数据源说明**：游戏详情（名称、价格、海报、好评率等）来自 Steam 商店 API（非公开、易限流）；在线人数来自 Steam Web API。兜底池可来自 Steam 商店新品搜索 + SteamSpy；若 SteamSpy 不可用，实际降级主要依赖本地缓存、`fallback_games.json` 与代码内硬编码池（如 `TRENDING_FALLBACK_POOL`）。**Store 数据层**：已引入独立模块 `storeService.js`，负责批量请求 Steam appdetails、Redis 缓存与并发限制，单次推荐流程最多 1–2 次 Steam Store 批量请求，已缓存游戏不再请求 Steam，限流风险显著下降（见 §2.27）。**Nightly 同步**：已增加 `GET /api/cron/sync-steamspy` 与 `services/syncSteamSpy.ts`（SteamSpy 数据写入 `steam_meta:{appid}`）；当前为**串行执行**、每请求间隔 2s、429/503/500/「Too many connections」指数退避（2s→4s→8s）、**每日**同步 top100in2weeks + top100forever + top100owned + **2 页 all**（约 10 天建全库）、Upstash 下 **pipeline 批量写入**、24h 幂等；遇 Cloudflare 403 可配置 `STEAMSPY_PROXY_URL`（见 §2.28、§2.31）。**统一评分**：`services/scoreService.ts` 基于本地 SteamSpy 数据计算 0–100 分，推荐候选池与场景内游戏按分数排序，不依赖 Steam 排序（见 §2.29）。**API 监控**：`services/metricsService.ts` 统计 Steam Store / SteamSpy 调用与缓存命中率，`GET /api/metrics` 返回当日统计，每日自动重置（见 §2.30）。
 
 ## 2. Implemented Features
 
@@ -140,7 +140,7 @@ The project is in a **working but network-sensitive** state with a multi-step UI
 
 ### 2.16 Automated Fallback Pool (“New Games Scout”)
 - **Schedule**: `node-cron` runs every **3 days** (`0 0 */3 * *`) and once ~15s after Redis is ready, calling `refreshFallbackPoolFromSteam()`；Vercel 上由 Cron 触发 `GET /api/cron/refresh-pool` 替代。
-- **Sources**: `fetchSteamNewReleases()` POSTs to Steam store search with `sort_by=Released_Desc` and parses app IDs (up to ~400); if fewer than 100 are returned, `fetchSteamSpyTopGames()` supplements with SteamSpy `request=all` (by positive ratio). **Note**: SteamSpy 在某些环境下不可用，此时实际兜底主要靠本地 `fallback_games.json` 与代码内 `TRENDING_FALLBACK_POOL` 等硬编码池。
+- **Sources**: `fetchSteamNewReleases()` POSTs to Steam store search with `sort_by=Released_Desc` and parses app IDs (up to ~400); if fewer than 100 are returned, `fetchSteamSpyTopGames()` supplements with SteamSpy `request=all` (by positive ratio). **SteamSpy 非 JSON 响应**：当 SteamSpy 返回 HTML/错误页（如 Vercel 环境下偶发）时，`fetchSteamSpyTopGames` 先 `res.text()` 再判断是否以 `{` 开头并安全 `JSON.parse`，解析失败则记录片段并跳过该页，避免「意外的标记…不是有效的 JSON」抛错。**无 ID 时硬编码补充**：若 Steam 与 SteamSpy 均未收集到任何 appId，`refreshFallbackPoolFromSteam` 使用 `TRENDING_FALLBACK_POOL` 写入 Redis，避免「未收集到任何应用 ID，跳过 Redis 更新」导致池子长期为空。
 - **Redis sync**: `refreshFallbackPoolFromSteam()` clears the pool and repopulates: writes to **ZSET** `steam_sense:fallback_pool_v2` with freshness scores and to **Set** `steam_sense:fallback_pool` for backward compatibility. Optional env: `STEAMSPY_API_BASE`.
 
 ### 2.17 ZSET Fallback Pool (Freshness-weighted)
@@ -211,9 +211,16 @@ The project is in a **working but network-sensitive** state with a multi-step UI
 - **说明**: 当前缓存仅含 appdetails 可提供字段；`positiveRate`、`currentPlayers` 在 store 层为 `'N/A'`，未单独请求 review/players 以控制请求量。
 
 ### 2.28 Nightly 数据同步与预留接口
-- **SteamSpy 同步**：`services/syncSteamSpy.ts` 导出 `runSyncSteamSpy(config)`，供 **GET /api/cron/sync-steamspy** 与命令行脚本 `scripts/syncSteamSpy.ts` 共用；支持 **maxPages**（默认 20 页，约 1–2 万条）、**断点续传**（某页 24h 内已同步则跳过，Redis 键 `steam_spy_sync:page:{page}`）、**进度日志**（page x / total、当前累计数量）；写入 Redis `steam_meta:{appid}`，TTL 可配置（默认 7 天）；不修改推荐逻辑。
-- **Cron 接口**：`GET /api/cron/sync-steamspy` 需 query `secret` 等于 `STEAMSPY_SYNC_CRON_SECRET` 或 `CRON_SECRET`，否则 401；无 Redis 时 503；成功返回 `{ success, totalSync, success, fail, elapsedSec }`。Vercel Cron 已配置每日 `0 0 * * *`。
+- **SteamSpy 同步**：`services/syncSteamSpy.ts` 导出 `runSyncSteamSpy(config)`，供 **GET /api/cron/sync-steamspy** 与命令行脚本 `scripts/syncSteamSpy.ts` 共用。**串行执行**（禁止 Promise.all/多页并发）；每请求间隔 **2 秒**（`PAGE_INTERVAL_MS`）；**指数退避**：429/503/500/连接失败或响应含「Too many connections」时 2s→4s→8s 重试，最多 3 次；**每日范围**：依次请求 top100in2weeks、top100forever、top100owned，再请求 2 页 `request=all&page=N`（`steamspy:all:next_page` 记录进度，约 10 天跑满 20 页）；**幂等**：24h 内已同步则直接返回（Redis 键 `steamspy:last_sync_timestamp`）；Upstash 下使用 **pipeline 批量写入**，避免逐条 set 导致「Too many connections」；写入 `steam_meta:{appid}`，TTL 可配置（默认 7 天）；不修改推荐逻辑。详见 §2.31。
+- **Cron 接口**：`GET /api/cron/sync-steamspy` 需 query `secret` 等于 `STEAMSPY_SYNC_CRON_SECRET` 或 `CRON_SECRET`，否则 401；无 Redis 时 503；成功返回 `{ success, total_pages, total_games, successful_batches, failed_batches, duration_ms, ... }`。Vercel Cron 已配置每日 `0 0 * * *`。
 - **预留扩展**：`syncStoreMeta(appIds)` 已在 server 中实现并导出（`module.exports.syncStoreMeta`），内部调用 `storeService.syncStoreMetaToRedis(ids, 'zh-CN')`，供后续 nightly store meta 同步或内部调用；推荐逻辑未改动。
+
+### 2.31 SteamSpy 同步：403/代理与「Too many connections」排查
+- **fetchWithStatus**：cron 与脚本均通过 `fetchWithStatus(url)` 返回 `{ status, data }`，便于 429/503/500 时触发指数退避；非 200 或 body 非 JSON 时按需重试。
+- **Cloudflare 403**：SteamSpy 前置 Cloudflare 时直连可能返回 403（「Just a moment...」）。请求头已加浏览器式 User-Agent、Accept、Referer、Origin；**本地脚本**支持 `STEAMSPY_PROXY_URL`（如 `http://127.0.0.1:7890`），通过 undici `ProxyAgent` 走代理，可绕过 403；cron 环境依赖部署出口 IP，未单独配置代理。
+- **「Too many connections」**：SteamSpy 服务端限流时返回 200 且 body 为 `Connection failed: Too many connections`（非 JSON）。脚本与 server 检测到 body 含 `too many connections|connection failed` 且未解析出 JSON 时，**视为 503** 返回，触发 2s→4s→8s 重试；并将请求间隔固定为 2s，减轻压力。
+- **500 与空 body**：500 已加入可重试状态；若 500 且 body 为空，日志提示可能为代理连接上游失败，建议浏览器开代理访问同一 API 测试。
+- **依赖**：脚本使用代理时需 `undici`（已加入 dependencies）；TypeScript 中 undici Response 与 DOM Response 通过 `as unknown as Promise<Response>` 兼容。
 
 ### 2.29 统一评分模型（scoreService）
 - **模块**：`services/scoreService.ts`，基于本地 SteamSpy 数据（`steam_meta:*`）计算 0–100 标准化分数，**禁止为排序调用 Steam API**。
@@ -295,14 +302,13 @@ The project is in a **working but network-sensitive** state with a multi-step UI
 - `STEAMSPY_BASE_URL` (default `https://steamspy.com`)
 - `STEAMSPY_CACHE_TTL` (default 7 天，秒)
 - `STEAMSPY_SYNC_CRON_SECRET`（保护 `/api/cron/sync-steamspy`，可与 `CRON_SECRET` 共用）
-- `STEAMSPY_SYNC_MAX_PAGES` (default `20`，同步页数，约 1–2 万条)
-- `STEAMSPY_SKIP_PAGE_WITHIN_HOURS` (default `24`，断点续传：该小时数内已同步页跳过，0 表示不跳过)
+- `STEAMSPY_PROXY_URL`（仅脚本：本地走代理访问 SteamSpy，如 `http://127.0.0.1:7890`，用于绕过 Cloudflare 403；cron 未使用）
 ### Optional Fallback Pool (Steam/SteamSpy)
 - `STEAMSPY_API_BASE` (default `https://steamspy.com/api.php`)
 
 ## 6. Known Risks / Issues
 1. **Steam 商店 API** 非公开、无 SLA，易限流或偶发不可用；项目已通过 **storeService 批量请求 + Redis 缓存**、重试、备用池替换、前端批量补全与占位卡片 0/3/8s 重试缓解，但无法根治。
-2. **SteamSpy** 在某些网络环境下不可用，此时兜底池仅依赖 Steam 商店新品搜索 + 本地 `fallback_games.json` 与硬编码池。
+2. **SteamSpy** 在某些网络环境下不可用或返回非 JSON（如 HTML 错误页、Cloudflare 403、「Too many connections」）；已做安全解析、403/500 日志与「Too many connections」按 503 重试，脚本可配置 `STEAMSPY_PROXY_URL` 绕 403；当 Steam + SteamSpy 均无 ID 时用 `TRENDING_FALLBACK_POOL` 补充兜底池，避免池子为空。
 3. Steam/AI 网络不稳定（尤其大陆线路）仍可能影响数据质量；降级与重试已加强，但未消除。
 4. Degraded profile mode can proceed with incomplete Steam data (`gameCount=0`, `totalPlaytime=Unknown`) during outages.
 5. AI output quality depends on provider compatibility with JSON-structured responses.
@@ -327,7 +333,7 @@ The project is in a **working but network-sensitive** state with a multi-step UI
 
 ## 9. 未来计划 / Future Plans（预留扩展）
 
-- **Nightly SteamSpy 同步（已实现）**：`GET /api/cron/sync-steamspy` 每日触发，调用 `runSyncSteamSpy` 将 SteamSpy 数据写入 `steam_meta:{appid}`；脚本 `npm run sync:steamspy` 与 cron 共用 `services/syncSteamSpy.ts`。
+- **Nightly SteamSpy 同步（已实现并重构）**：`GET /api/cron/sync-steamspy` 每日触发，调用 `runSyncSteamSpy` 将 SteamSpy 数据写入 `steam_meta:{appid}`；脚本 `npm run sync:steamspy` 与 cron 共用 `services/syncSteamSpy.ts`；逻辑为串行、2s 间隔、429/503/500/「Too many connections」退避、每日 top100×3 + 2 页 all（10 天建库）、pipeline 批量写、24h 幂等；可选 `STEAMSPY_PROXY_URL` 绕 Cloudflare 403（§2.31）。
 - **Nightly store meta 同步（预留）**：计划每日凌晨从 SteamSpy 抓 **top 1000** appIds，**批量同步 store meta 到 Redis**；推荐阶段**只读本地（Redis）数据**，Steam API **仅用于补充缺失**。
 - **已预留扩展接口**：
   - **syncStoreMeta(appIds)**（server 导出）：内部调用 `storeService.syncStoreMetaToRedis(ids, 'zh-CN')`，供未来 cron 或内部批量同步 store meta 使用。
@@ -363,5 +369,5 @@ The project is in a **working but network-sensitive** state with a multi-step UI
 - [ ] Store 数据层：推荐/塔罗/补全等商店元数据经 storeService.getGamesMeta 批量拉取；日志有 `[store-service] getGamesMeta: requested=… cacheHits=… steamBatches=…`。
 - [ ] `npm run test:e2e` passes (Playwright: auto-hydrate, loader buffer, scenario chip fade).
 - [ ] （可选）`GET /api/cron/sync-store-meta?secret=...` 返回 `requested/synced/failed/steamBatches`；无 secret 时若配置了 STORE_SYNC_CRON_SECRET 则 401。
-- [ ] （可选）`GET /api/cron/sync-steamspy?secret=...` 返回 `success, totalSync, success, fail, elapsedSec`；无 secret 时若配置了 STEAMSPY_SYNC_CRON_SECRET 则 401；无 Redis 时 503。
+- [ ] （可选）`GET /api/cron/sync-steamspy?secret=...` 返回 `success, total_pages, total_games, successful_batches, failed_batches, duration_ms`；无 secret 时若配置了 STEAMSPY_SYNC_CRON_SECRET 则 401；无 Redis 时 503；24h 内重复调用会跳过（skipped）。
 - [ ] `GET /api/metrics` 返回 `steamStoreCalls`、`steamSpyCalls`、`cacheHitRate`（0–1）、`lastReset`（时间戳）；统计每日自动重置。
