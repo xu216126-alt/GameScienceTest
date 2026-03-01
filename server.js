@@ -427,6 +427,7 @@ async function runBatched(tasks, concurrency = STEAMSPY_ENRICH_CONCURRENCY, dela
 /**
  * Fetch top games from SteamSpy (by ownership/relevance). Used as fallback when store search returns few.
  * Prioritize games with decent positive ratio; no release-date filter.
+ * 若 SteamSpy 返回 HTML/错误页（非 JSON），安全跳过并记录片段，避免 JSON 解析抛错。
  */
 async function fetchSteamSpyTopGames(limit = 300) {
   const all = [];
@@ -435,7 +436,25 @@ async function fetchSteamSpyTopGames(limit = 300) {
     try {
       const url = `${STEAMSPY_API_BASE}?request=all&page=${page}`;
       const res = await fetch(url, { signal: AbortSignal.timeout(UPSTREAM_TIMEOUT_MS) });
-      const data = await res.json();
+      const text = await res.text();
+      if (!res.ok) {
+        console.warn(`fetchSteamSpyTopGames page ${page}: HTTP ${res.status}, body snippet: ${text.slice(0, 120)}`);
+        break;
+      }
+      const trimmed = text.trim();
+      if (!trimmed.startsWith('{')) {
+        console.warn(
+          `fetchSteamSpyTopGames page ${page}: response is not JSON (starts with "${trimmed.slice(0, 50)}..."), skipping`
+        );
+        break;
+      }
+      let data;
+      try {
+        data = JSON.parse(text);
+      } catch (parseErr) {
+        console.warn(`fetchSteamSpyTopGames page ${page}: JSON parse error: ${parseErr?.message}, snippet: ${trimmed.slice(0, 120)}`);
+        break;
+      }
       if (!data || typeof data !== 'object') break;
 
       const entries = Object.values(data).filter((e) => e && Number.isInteger(e.appid) && e.appid > 0);
@@ -495,7 +514,11 @@ async function refreshFallbackPoolFromSteam() {
   }
 
   if (appIds.length === 0) {
-    console.warn('refreshFallbackPoolFromSteam: no app IDs collected, skipping Redis update');
+    console.warn('refreshFallbackPoolFromSteam: no app IDs from Steam/SteamSpy, using hardcoded fallback pool');
+    appIds = TRENDING_FALLBACK_POOL.slice(0, FALLBACK_POOL_TARGET_SIZE);
+  }
+  if (appIds.length === 0) {
+    console.warn('refreshFallbackPoolFromSteam: still no app IDs, skipping Redis update');
     return;
   }
 
