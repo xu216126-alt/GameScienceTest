@@ -305,6 +305,8 @@ const translations = {
     analysisRunning: "正在进行 AI 分析...",
     analysisComplete: "分析完成",
     errorLabel: "错误",
+    networkErrorRetry: "网络请求被中断或暂停（如切换了标签页、页面在后台），请保持本页在前台后点击「刷新推荐」重试。",
+    backToForegroundRetry: "已回到前台，正在重新请求…",
     noProfile: "未加载资料",
     openAnalysisFirst: "请先进入分析页再刷新推荐。",
     refreshing: "正在生成新的推荐列表...",
@@ -499,6 +501,8 @@ const HISTORY_STORAGE_KEY = "steamsense.recommendationHistory.v1";
 const SESSION_STORAGE_KEY = "steamsense.session.v1";
 /** 刷新用缓存池：后台预取的一组推荐结果，用户点刷新时先展示再背后补请求 */
 let refreshCache = null;
+/** 分析/刷新因网络被暂停而失败时置为 true，用于回到前台后自动重试 */
+let lastAnalysisNetworkError = false;
 
 const refreshFlavors = [
   "focus on indie gems",
@@ -1498,6 +1502,20 @@ function pickScenarioAnglePack() {
   return scenarioAnglePacks[idx];
 }
 
+function isNetworkOrSuspendError(error) {
+  if (!error || typeof error !== "object") return false;
+  const msg = String(error.message || "").toLowerCase();
+  const name = String(error.name || "").toLowerCase();
+  return (
+    name === "typeerror" ||
+    msg.includes("failed to fetch") ||
+    msg.includes("load failed") ||
+    msg.includes("network") ||
+    msg.includes("suspended") ||
+    msg.includes("aborted")
+  );
+}
+
 async function fetchAiAnalysis(steamId, profileHint, refreshToken = "", refreshOptions = {}, explicitDeviceProfile = null) {
   const deviceProfile = explicitDeviceProfile || collectDeviceProfile();
   const analysisNonce = `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
@@ -1760,6 +1778,7 @@ async function handleStep2Analyze() {
     applyAiResult(ai, null, { updatePersona: true });
     analysisSuccess = true;
     isAnalyzing = false;
+    lastAnalysisNetworkError = false;
     summary.textContent = ai.summary || `${t("analysisComplete")} · ${currentProfileData.personaName}`;
     if (ai.usedFallback) {
       showRefiningIndicator();
@@ -1788,7 +1807,8 @@ async function handleStep2Analyze() {
   } catch (error) {
     isAnalyzing = false;
     setStatus(t("errorLabel"), "#ff6c7a");
-    summary.textContent = error.message;
+    summary.textContent = isNetworkOrSuspendError(error) ? t("networkErrorRetry") : (error.message || t("errorLabel"));
+    lastAnalysisNetworkError = isNetworkOrSuspendError(error);
   }
 
   const elapsed = Date.now() - startedAt;
@@ -1812,6 +1832,7 @@ async function handleRefreshRecommendations() {
     const { data, order } = refreshCache;
     refreshCache = null;
     refreshCount += 1;
+    lastAnalysisNetworkError = false;
     applyAiResult(data, order, { updatePersona: false });
     summary.textContent = data.summary || t("refresh");
     setStatus(t("analysisComplete"), "#39d6c6");
@@ -1847,13 +1868,14 @@ async function handleRefreshRecommendations() {
       }
     );
     applyAiResult(ai, order, { updatePersona: false });
-
+    lastAnalysisNetworkError = false;
     summary.textContent = ai.summary || t("refresh");
     setStatus(t("analysisComplete"), "#39d6c6");
     startBackgroundRefreshPrefetch();
   } catch (error) {
     setStatus(t("errorLabel"), "#ff6c7a");
-    summary.textContent = error.message;
+    summary.textContent = isNetworkOrSuspendError(error) ? t("networkErrorRetry") : (error.message || t("errorLabel"));
+    lastAnalysisNetworkError = isNetworkOrSuspendError(error);
   } finally {
     isAnalyzing = false;
     renderRecommendations(currentScenarioData, currentScenarioOrder);
@@ -1946,6 +1968,15 @@ gameModal.addEventListener("click", (event) => {
 
 document.addEventListener("keydown", (event) => {
   if (event.key === "Escape" && gameModal.open) closeModal();
+});
+
+document.addEventListener("visibilitychange", () => {
+  if (document.visibilityState !== "visible") return;
+  if (currentStep !== 3 || !lastAnalysisNetworkError || isAnalyzing) return;
+  lastAnalysisNetworkError = false;
+  setStatus(t("backToForegroundRetry"), "#f5ae2b");
+  summary.textContent = t("backToForegroundRetry");
+  setTimeout(() => handleRefreshRecommendations(), 400);
 });
 
 function attachHapticClick(target) {
@@ -2215,8 +2246,9 @@ if (tarotCard) {
         setSoulLoading(false);
         if (soulLoading) soulLoading.classList.remove("soul-loading--syncing");
         setStatus(t("errorLabel"), "#ff6c7a");
-        summary.textContent = error.message || t("errorLabel");
-        setCurrentStep(1);
+        summary.textContent = isNetworkOrSuspendError(error) ? t("networkErrorRetry") : (error.message || t("errorLabel"));
+        lastAnalysisNetworkError = isNetworkOrSuspendError(error);
+        if (!isNetworkOrSuspendError(error)) setCurrentStep(1);
       });
   } else {
     step1Status.textContent = t("step1Waiting");

@@ -1,7 +1,7 @@
-# SteamSense AI - Progress Handoff (2026-02-28)
+# SteamSense AI - Progress Handoff (2026-03-01)
 
 ## 1. Current Status
-The project is in a **working but network-sensitive** state with a multi-step UI flow. The UI is **Chinese-only** (no language toggle). AI prompts and API continue to support `lang`; frontend always sends `zh-CN`. **Vercel 部署**：静态资源已改为通过 `public/` 目录由 Vercel 静态构建提供，首页与静态文件不再经 serverless 函数，避免出现 `{"error":"Not found"}`；推送 Git 后自动部署。
+The project is in a **working but network-sensitive** state with a multi-step UI flow. The UI is **Chinese-only** (no language toggle). AI prompts and API continue to support `lang`; frontend always sends `zh-CN`. **Vercel 部署**：静态资源已改为通过 `public/` 目录由 Vercel 静态构建提供，首页与静态文件不再经 serverless 函数，避免出现 `{"error":"Not found"}`；推送 Git 后自动部署。**数据源说明**：游戏详情（名称、价格、海报、好评率等）来自 Steam 商店 API（非公开、易限流）；在线人数来自 Steam Web API。兜底池可来自 Steam 商店新品搜索 + SteamSpy；若 SteamSpy 不可用，实际降级主要依赖本地缓存、`fallback_games.json` 与代码内硬编码池（如 `TRENDING_FALLBACK_POOL`）。**Store 数据层**：已引入独立模块 `storeService.js`，负责批量请求 Steam appdetails、Redis 缓存与并发限制，单次推荐流程最多 1–2 次 Steam Store 批量请求，已缓存游戏不再请求 Steam，限流风险显著下降（见 §2.27）。**Nightly 同步**：已增加 `GET /api/cron/sync-steamspy` 与 `services/syncSteamSpy.ts`（SteamSpy 数据写入 `steam_meta:{appid}`），支持 maxPages（默认 20 页）、断点续传（24h 内已同步页跳过）、进度日志；预留扩展接口 `syncStoreMeta(appIds)`（见 §2.28）。**统一评分**：`services/scoreService.ts` 基于本地 SteamSpy 数据计算 0–100 分，推荐候选池与场景内游戏按分数排序，不依赖 Steam 排序（见 §2.29）。**API 监控**：`services/metricsService.ts` 统计 Steam Store / SteamSpy 调用与缓存命中率，`GET /api/metrics` 返回当日统计，每日自动重置（见 §2.30）。
 
 ## 2. Implemented Features
 
@@ -67,6 +67,7 @@ The project is in a **working but network-sensitive** state with a multi-step UI
   - Cycles scenario angles to increase variety.
 - **刷新缓存机制**：首次分析或每次刷新成功后，后台静默预取一组「下一轮刷新」结果写入 `refreshCache`；用户点刷新时**仅当缓存通过校验**（每场景至少 3 款、与当前展示重叠 ≤40%）才先展示缓存并背后再请求，否则走正常请求；预取结果也仅在通过同样校验时才写入缓存，避免「同一批游戏换场景」的观感。登出或切换 Steam 账号时清空缓存。见 §2.26。
 - **会话黑名单与跨场景去重**：后端将本次返回的全部推荐 appId 写入会话黑名单（Redis/内存），刷新与预取请求均携带前端 `excludedAppIds` 并与服务端黑名单合并，严禁再次推荐；响应前对场景做 `dedupeScenariosGlobally`，保证同一款游戏只出现在一个场景中，避免「同一游戏在不同场景间来回出现」。
+- **兜底占位卡片与商店拉取失败**：推荐流程统一经 **storeService.getGamesMeta** 批量拉取商店元数据（先 Redis 缓存、缺失再请求 Steam，见 §2.27）；若某款游戏在批量结果中缺失，`enrichScenariosWithStoreData` 从 `alternatePool`（主流程传 `TRENDING_FALLBACK_POOL`，救急填充传 rescue 候选 + TRENDING_FALLBACK_POOL）中尝试替换为其他 appId（同批 meta 已含 alternatePool，无需再请求）。前端对仍为占位的卡片（`game-card--placeholder`）在 0ms、3s、8s 调用 `GET /api/game-details-batch?appIds=...` 拉取详情并原地更新标题、封面、价格、指标；「查看详情」按钮从当前卡片 DOM 读标题，保证补全后名称正确。
 
 ### 2.6 Localization (Chinese-only)
 - **Language toggle removed.** All UI and visible content are **Chinese only** (`zh-CN`). Frontend uses `currentLang = "zh-CN"` and `t()` reads only from `translations["zh-CN"]`.
@@ -85,6 +86,7 @@ The project is in a **working but network-sensitive** state with a multi-step UI
   - Cached profile can be returned when upstream fails.
 - Degraded profile fallback:
   - If Steam profile fetch fails and no cache exists, API returns a degraded profile with `stale: true`, `degraded: true`, and warning message (HTTP 200).
+- **网络/暂停类错误（如 ERR_NETWORK_IO_SUSPENDED）**：前端用 `isNetworkOrSuspendError(error)` 识别（Failed to fetch、TypeError、suspended、aborted 等），展示友好文案「网络请求被中断或暂停…请保持本页在前台后点击刷新推荐重试」；分析失败时若是该类错误则**不退回 Step 1**，留在 Step 3 便于用户直接点刷新。**回到前台自动重试**：监听 `visibilitychange`，当用户从其他标签页切回本页且当前为 Step 3、上次失败为网络/暂停类、未在请求中时，自动调用 `handleRefreshRecommendations()`（延迟 400ms），并显示「已回到前台，正在重新请求…」。
 
 ### 2.8 Differential Analysis & Personalized Greetings
 - **Storage (Redis)**: Profile snapshots and diffs are stored in Redis keyed by `steamId`. Snapshot contains `recentTotalHours` and `recentGames` (with `playtime2WeeksHours`). Implemented via `getProfileSnapshot` / `setProfileSnapshot` and `getProfileDiff` / `setProfileDiff` using `redis` client.
@@ -104,9 +106,10 @@ The project is in a **working but network-sensitive** state with a multi-step UI
 ### 2.10 Session Blacklist (Short-term Memory)
 - **Redis key**: `steam_sense:session_blacklist:{steamId}` (Redis Set), TTL `SESSION_BLACKLIST_TTL_SEC` (default 10 minutes). In-memory fallback `FALLBACK_SESSION_BLACKLIST` when Redis is down.
 - **Read**: `getSessionBlacklist(steamId)` returns appIds to exclude. **Write**: `addToSessionBlacklist(steamId, appIds)` adds IDs and refreshes TTL.
+- **Cap**: 黑名单最多保留最近 **50** 条（`SESSION_BLACKLIST_MAX_SIZE`）；`addToSessionBlacklist` 合并新 ID 后去重并截断为 50，保证长期刷新不会无限增长。
 - **Usage in `/api/ai-analysis`**: Before building `aiContext`, server merges request body `excludedAppIds` with `getSessionBlacklist(steamId)` into `mergedExcludedSessionAppIds`. This is passed as `excludedSessionAppIds` to the AI and used in all dedupe/forbidden lists (dedupeAndDiversifyScenarioGames, ensureScenarioMinimums, enrichScenariosWithStoreData, repairEmptyNonBacklogLanes, backlogReviver).
 - **Fallback pool**: `getFallbackPoolGamesFromRedis(ownedAppIds, sessionBlacklistAppIds, count)` excludes both owned and session-blacklisted IDs so Redis fallback never re-recommends recently shown games.
-- **Update after success**: After building the final `framedScenarios`, all recommended `appId`s from every lane are collected and `addToSessionBlacklist(steamId, newlyRecommendedIds)` is called so the next refresh (within 10 min) avoids those games.
+- **Update after success**: After building the final deduped scenarios, all recommended `appId`s from every lane are collected and `addToSessionBlacklist(steamId, newlyRecommendedIds)` is called so the next refresh (within 10 min) avoids those games.
 
 ### 2.11 Circuit Breaker & Health
 - **Redis graceful fallback**: If Redis is unavailable or errors, snapshot/diff use in-memory caches (`FALLBACK_SNAPSHOT_CACHE`, `FALLBACK_DIFF_CACHE`) with TTL; `redisHealthy` is set false so fallback pool returns `[]` until Redis is ready again. App does not crash.
@@ -136,9 +139,9 @@ The project is in a **working but network-sensitive** state with a multi-step UI
 - **Copy**: Fallback game reasons use `buildTagAwareFallbackReason(lang, preferredTags)` (e.g. “Because you've spent so much time in [Top Tag]-flavored games…” / “因为你在「…」相关的游戏上已经投入了不少时间…”).
 
 ### 2.16 Automated Fallback Pool (“New Games Scout”)
-- **Schedule**: `node-cron` runs every **3 days** (`0 0 */3 * *`) and once ~15s after Redis is ready, calling `refreshFallbackPoolFromSteam()`.
-- **Sources**: `fetchSteamNewReleases()` POSTs to Steam store search with `sort_by=Released_Desc` and parses app IDs from the response (up to ~400); if fewer than 100 are returned, `fetchSteamSpyTopGames()` supplements with SteamSpy `request=all` (by positive ratio).
-- **Redis sync**: `refreshFallbackPoolFromSteam()` clears the pool and repopulates: writes to **ZSET** `steam_sense:fallback_pool_v2` with freshness scores and to **Set** `steam_sense:fallback_pool` for backward compatibility. Optional env: `STEAMSPY_API_BASE`. Dependency: `node-cron`.
+- **Schedule**: `node-cron` runs every **3 days** (`0 0 */3 * *`) and once ~15s after Redis is ready, calling `refreshFallbackPoolFromSteam()`；Vercel 上由 Cron 触发 `GET /api/cron/refresh-pool` 替代。
+- **Sources**: `fetchSteamNewReleases()` POSTs to Steam store search with `sort_by=Released_Desc` and parses app IDs (up to ~400); if fewer than 100 are returned, `fetchSteamSpyTopGames()` supplements with SteamSpy `request=all` (by positive ratio). **Note**: SteamSpy 在某些环境下不可用，此时实际兜底主要靠本地 `fallback_games.json` 与代码内 `TRENDING_FALLBACK_POOL` 等硬编码池。
+- **Redis sync**: `refreshFallbackPoolFromSteam()` clears the pool and repopulates: writes to **ZSET** `steam_sense:fallback_pool_v2` with freshness scores and to **Set** `steam_sense:fallback_pool` for backward compatibility. Optional env: `STEAMSPY_API_BASE`.
 
 ### 2.17 ZSET Fallback Pool (Freshness-weighted)
 - **Key**: `steam_sense:fallback_pool_v2` (Redis Sorted Set). **Scoring**: When populating, newer games get higher scores (e.g. `1e10 + (length - 1 - index)` for Steam new-releases order; file-seeded games get `1e8`).
@@ -164,10 +167,11 @@ The project is in a **working but network-sensitive** state with a multi-step UI
 
 ### 2.21 Daily Fortune (每日运势 / 赛博塔罗)
 - **Endpoint**: `GET /api/daily-fortune?steamId=<17-digit>&lang=zh-CN`
-- **Daily lock**: Redis key `steam_sense:daily_fortune:${steamId}` (TTL 24h). Same user gets the same card and fortune for 24 hours; after TTL expires, next request draws a new card.
-- **Cyber Tarot cards**: 15 张赛博塔罗牌（防火墙、缓存、延迟尖峰、重生、模组师、速通、刷子、联机、随机数、补丁、成就、待办库、DLC、季票、抢先体验）。按 `steamId + 当日 UTC 日期` 做确定性哈希，得到当日牌面。
-- **Fortune logic**: 用牌名 + 用户 `activityDiff`（来自 Redis diff）调用 AI，扮演赛博神谕，产出约 50 字运势，并从候选游戏列表中选**恰好一款**推荐游戏（候选来自 fallback pool 或 TRENDING_FALLBACK_POOL）。
-- **Response**: `{ card: { id, name }, fortune: string, game: { appId, name, media, price, positiveRate, players, reason, steamUrl } }`。若无缓存则先拉 profile diff、候选游戏，再调 AI，写入 Redis 后返回。
+- **Daily lock & 每日更新**: 缓存键为 **`steam_sense:daily_fortune:${steamId}:${dateStr}`**（`dateStr` = 当日 UTC 日期 `YYYY-MM-DD`，由 `getDailyFortuneDateString()` 提供）。同用户同日同牌、同运势、同本命游戏；**跨日后键变化，自动重新抽牌与选游戏**，实现每日更新。
+- **Cyber Tarot cards**: 15 张赛博塔罗牌。按 `steamId + dateStr` 做确定性哈希选牌，**不同用户不同牌，同一用户不同日不同牌**。
+- **本命游戏差异化**: 候选游戏列表由 `getCandidateGamesForFortune` 生成，种子为 **`${steamId}:${dateStr}`** 传入 `getFallbackPoolGamesFromRedis`，故不同用户、同一用户不同日候选顺序/集合不同，AI 选出的本命游戏随之不同。
+- **Fortune logic**: 用牌名 + 用户 `activityDiff`（来自 Redis diff）调用 AI，扮演赛博神谕，产出约 50 字运势，并从候选列表中选**恰好一款**推荐游戏。
+- **Response**: `{ card: { cardId, cardName, cardImageUrl }, fortune: string, game: { appId, name, media, price, positiveRate, players, reason, steamUrl } }`。若无缓存则先拉 profile diff、候选游戏，再调 AI，写入 Redis 后返回。
 - **Frontend flow**: 点击牌面 → 进入仪式（粒子向牌汇聚）→ 牌面颤动固定时长 → 翻牌 + 霓虹冲击波 + 翻牌音效 → 约 1 秒后自动「炸开」退出仪式，粒子恢复。每人每天仅可抽一次；再次访问直接展示缓存结果。
 
 ### 2.22 Step 3 Header (Cyber-HUD) & 命运洞察
@@ -196,10 +200,35 @@ The project is in a **working but network-sensitive** state with a multi-step UI
 - **预取参数**: 使用 `refreshCount + 1` 对应的 scenarioAnglePack 与 `shuffledScenarioOrder()`，保证下一轮展示与「真实再点一次刷新」一致。
 - **清空时机**: `resetToLoggedOutState()`、切换 Steam 账号时（`steamId !== currentSteamId`）置 `refreshCache = null`。
 
+### 2.27 Store Service Layer（商店元数据批量与缓存）
+- **模块**: `storeService.js`，负责 Steam 商店 appdetails 的批量请求、Redis 缓存与并发限制，目标为单次推荐流程最多 1–2 次 Steam Store 批量请求，降低 Vercel serverless 下限流风险。
+- **批量请求**: `getGamesMeta(appIds, lang)` 一次接收多个 appId，内部按最多 **30 个一批** 拆分请求 Steam `/api/appdetails?appids=id1,id2,...`；若某批只返回部分结果则对未命中 id 做单 id 请求，仍受 p-limit 限制。
+- **Redis 缓存**: key `steam_sense:store_meta:{appId}`，TTL 86400 秒（可配置 `STORE_META_TTL_SEC`）；先查缓存，缺失再请求 Steam，请求成功后写回缓存；已缓存游戏不再请求 Steam。
+- **并发限制**: 使用 `p-limit`，最大并发 3（可配置 `STORE_CONCURRENCY`）。
+- **代理**: 请求使用 `STEAM_STORE_BASE_URL`，可指向 HK VPS 代理。
+- **统一入口**: `enrichScenariosWithStoreData` 仅调用一次 `storeService.getGamesMeta(场景 + alternatePool 全部 appIds)`，用返回 Map 填主槽与备用槽；`repairEmptyNonBacklogLanes`、`getCandidateGamesForFortune`、每日运势本命游戏、`/api/game-details-batch`、`/api/game/:id` 均改为走 `getGamesMeta`，fallback 池取 genre 时也走 storeService（有缓存则直接用，不重复请求 store）。
+- **日志**: 每次 `getGamesMeta` 打印 `requested=`、`cacheHits=`、`steamBatches=`（本次向 Steam 发出的请求批次数）。
+- **说明**: 当前缓存仅含 appdetails 可提供字段；`positiveRate`、`currentPlayers` 在 store 层为 `'N/A'`，未单独请求 review/players 以控制请求量。
+
+### 2.28 Nightly 数据同步与预留接口
+- **SteamSpy 同步**：`services/syncSteamSpy.ts` 导出 `runSyncSteamSpy(config)`，供 **GET /api/cron/sync-steamspy** 与命令行脚本 `scripts/syncSteamSpy.ts` 共用；支持 **maxPages**（默认 20 页，约 1–2 万条）、**断点续传**（某页 24h 内已同步则跳过，Redis 键 `steam_spy_sync:page:{page}`）、**进度日志**（page x / total、当前累计数量）；写入 Redis `steam_meta:{appid}`，TTL 可配置（默认 7 天）；不修改推荐逻辑。
+- **Cron 接口**：`GET /api/cron/sync-steamspy` 需 query `secret` 等于 `STEAMSPY_SYNC_CRON_SECRET` 或 `CRON_SECRET`，否则 401；无 Redis 时 503；成功返回 `{ success, totalSync, success, fail, elapsedSec }`。Vercel Cron 已配置每日 `0 0 * * *`。
+- **预留扩展**：`syncStoreMeta(appIds)` 已在 server 中实现并导出（`module.exports.syncStoreMeta`），内部调用 `storeService.syncStoreMetaToRedis(ids, 'zh-CN')`，供后续 nightly store meta 同步或内部调用；推荐逻辑未改动。
+
+### 2.29 统一评分模型（scoreService）
+- **模块**：`services/scoreService.ts`，基于本地 SteamSpy 数据（`steam_meta:*`）计算 0–100 标准化分数，**禁止为排序调用 Steam API**。
+- **公式**：`parseOwnersToNumber(owners)` 解析区间字符串为均值；好评率 `positive/(positive+negative)`；`log(1+owners)` 与 `log(1+ccu)` 缩放；加权后归一化到 0–100。
+- **推荐流程**：候选池生成后调用 `calculateScore`，按 score 排序后再做场景过滤；`sortScenarioGamesByScore` 对各场景内游戏按分数排序，`getFallbackPoolGamesFromRedis` 返回列表按分数降序；排序数据仅来自 Redis `steam_meta:*`。
+
+### 2.30 Steam API 调用监控（metricsService）
+- **模块**：`services/metricsService.ts`，提供 `recordSteamStoreCall()`、`recordSteamSpyCall()`、`recordCacheHit()`、`recordCacheMiss()`；所有 storeService 与 cron 内 SteamSpy 调用经此统计。
+- **接口**：`GET /api/metrics` 返回 `{ steamStoreCalls, steamSpyCalls, cacheHitRate, lastReset }`（cacheHitRate 为 0–1，lastReset 为上次重置时间戳）。
+- **每日自动重置**：在任意 record 或 getMetrics 时若日期与 lastReset 不同则清零计数并更新 lastReset。
+
 ## 3. Key Files
 - Frontend (开发): `index.html`, `styles.css`, `script.js`（根目录）
 - Frontend (Vercel 静态): `public/index.html`, `public/styles.css`, `public/script.js`, `public/images/`
-- Backend: `server.js`
+- Backend: `server.js`, **storeService.js**（商店元数据批量与 Redis 缓存）, **services/syncSteamSpy.ts**（SteamSpy 同步）, **services/scoreService.ts**（统一评分）, **services/metricsService.ts**（API 调用监控）
 - Config: `vercel.json`, `.env.example`, `playwright.config.js`
 - Data: `fallback_games.json` (optional seed for pool)
 - E2E: `e2e/flow.spec.js`
@@ -212,7 +241,7 @@ The project is in a **working but network-sensitive** state with a multi-step UI
 ## 4.1 Vercel 部署
 - **vercel.json**：当前采用**单 build**：`server.js`（@vercel/node），`config.includeFiles: "public/**"` 将静态资源打入函数包；**routes** 全部指向 `server.js`（`/api`、`/auth`、`/(.*)`）。`server.js` 内 `serveStatic` 优先从 `ROOT/public` 提供首页与静态文件。
 - **静态资源**：前端文件放在 **`public/`**（`index.html`、`styles.css`、`script.js`、`images/` 等）；与根目录开发源文件需保持一致，修改后同步到 `public/` 再提交。
-- **Cron**：`GET /api/cron/refresh-pool` 由 Vercel Cron 每 3 天触发（`0 0 */3 * *`）；无需 node-cron。
+- **Cron**：`GET /api/cron/refresh-pool` 每 3 天（`0 0 */3 * *`）；`GET /api/cron/sync-store-meta`、`GET /api/cron/sync-steamspy` 每日 `0 0 * * *`；调用时需带相应 `secret`（见环境变量）。
 - **环境变量**：在 Vercel 控制台配置 `STEAM_API_KEY`、AI 密钥、`UPSTASH_REDIS_REST_URL` / `UPSTASH_REDIS_REST_TOKEN`（或 `REDIS_URL`）等。
 - **导出**：`module.exports = handler` 供 Vercel 调用；仅当 `require.main === module && NODE_ENV !== 'production'` 时执行 `server.listen`。
 - **自动部署**：推送至 Git 仓库（如 `main`）后，Vercel 会自动检测并部署。
@@ -245,7 +274,14 @@ The project is in a **working but network-sensitive** state with a multi-step UI
 
 ### Optional Steam Reverse Proxy
 - `STEAM_API_BASE_URL`
-- `STEAM_STORE_BASE_URL`
+- `STEAM_STORE_BASE_URL`（可指向 HK VPS 代理，storeService 使用）
+### Optional Store Service (storeService.js)
+- `STORE_META_TTL_SEC` (default `86400`，商店元数据 Redis 缓存 TTL 秒)
+- `STORE_CONCURRENCY` (default `3`，向 Steam Store 的并发请求上限)
+### Optional Nightly Store Meta Sync（未来计划，已预留）
+- `STORE_META_SYNC_TOP_N` (default `1000`，cron 从 SteamSpy 拉取的 top N)
+- `STORE_SYNC_CRON_SECRET`（保护 `/api/cron/sync-store-meta`，与 query `secret` 比对；也可用 `CRON_SECRET`）
+- `STORE_SYNC_APPIDS`（逗号分隔 appIds，测试用，覆盖 SteamSpy 来源）
 
 ### Optional Differential Analysis (snapshot/diff TTL)
 - `PROFILE_SNAPSHOT_TTL_SEC` (default 30 days)
@@ -254,13 +290,22 @@ The project is in a **working but network-sensitive** state with a multi-step UI
 - `REDIS_URL` (e.g. `redis://localhost:6379`)
 ### Optional Session Blacklist
 - `SESSION_BLACKLIST_TTL_SEC` (default 600 = 10 min)
+- `SESSION_BLACKLIST_MAX_SIZE` (default 50，黑名单最多保留条数)
+### Optional SteamSpy 同步（脚本与 GET /api/cron/sync-steamspy）
+- `STEAMSPY_BASE_URL` (default `https://steamspy.com`)
+- `STEAMSPY_CACHE_TTL` (default 7 天，秒)
+- `STEAMSPY_SYNC_CRON_SECRET`（保护 `/api/cron/sync-steamspy`，可与 `CRON_SECRET` 共用）
+- `STEAMSPY_SYNC_MAX_PAGES` (default `20`，同步页数，约 1–2 万条)
+- `STEAMSPY_SKIP_PAGE_WITHIN_HOURS` (default `24`，断点续传：该小时数内已同步页跳过，0 表示不跳过)
 ### Optional Fallback Pool (Steam/SteamSpy)
 - `STEAMSPY_API_BASE` (default `https://steamspy.com/api.php`)
 
 ## 6. Known Risks / Issues
-1. Steam/AI network path instability (especially from mainland routes) can still reduce data quality; now mitigated but not eliminated.
-2. Degraded profile mode can proceed with incomplete Steam data (`gameCount=0`, `totalPlaytime=Unknown`) during outages.
-3. AI output quality depends on provider compatibility with JSON-structured responses.
+1. **Steam 商店 API** 非公开、无 SLA，易限流或偶发不可用；项目已通过 **storeService 批量请求 + Redis 缓存**、重试、备用池替换、前端批量补全与占位卡片 0/3/8s 重试缓解，但无法根治。
+2. **SteamSpy** 在某些网络环境下不可用，此时兜底池仅依赖 Steam 商店新品搜索 + 本地 `fallback_games.json` 与硬编码池。
+3. Steam/AI 网络不稳定（尤其大陆线路）仍可能影响数据质量；降级与重试已加强，但未消除。
+4. Degraded profile mode can proceed with incomplete Steam data (`gameCount=0`, `totalPlaytime=Unknown`) during outages.
+5. AI output quality depends on provider compatibility with JSON-structured responses.
 
 ## 7. Deployment Guidance (HK Reverse Proxy)
 1. Deploy backend service on HK server with full `.env`.
@@ -280,7 +325,18 @@ The project is in a **working but network-sensitive** state with a multi-step UI
    - Fallback pool: ZSET v2 top-100 + diversity; Steam new-releases fetch + SteamSpy; cron refresh
    - Recommendation copy: no technical phrases; tags requirement; new-release reason override
 
-## 9. Quick Validation Checklist
+## 9. 未来计划 / Future Plans（预留扩展）
+
+- **Nightly SteamSpy 同步（已实现）**：`GET /api/cron/sync-steamspy` 每日触发，调用 `runSyncSteamSpy` 将 SteamSpy 数据写入 `steam_meta:{appid}`；脚本 `npm run sync:steamspy` 与 cron 共用 `services/syncSteamSpy.ts`。
+- **Nightly store meta 同步（预留）**：计划每日凌晨从 SteamSpy 抓 **top 1000** appIds，**批量同步 store meta 到 Redis**；推荐阶段**只读本地（Redis）数据**，Steam API **仅用于补充缺失**。
+- **已预留扩展接口**：
+  - **syncStoreMeta(appIds)**（server 导出）：内部调用 `storeService.syncStoreMetaToRedis(ids, 'zh-CN')`，供未来 cron 或内部批量同步 store meta 使用。
+  - **storeService.syncStoreMetaToRedis(appIds, lang)**：强制从 Steam 拉取并写入 Redis。
+  - **storeService.getTopAppIdsForSync(topN)** / **setGetTopAppIdsForSyncImpl(fn)**：server 已注入 `getSteamSpyTopAppIdsForStoreSync`。
+  - **GET /api/cron/sync-store-meta**：每日 `0 0 * * *`；query `?secret=STORE_SYNC_CRON_SECRET` 或 `CRON_SECRET`；使用 `getSteamSpyTopAppIdsForStoreSync` + `syncStoreMetaToRedis`。
+- **环境变量**：见 .env.example 中 `STORE_META_SYNC_TOP_N`、`STORE_SYNC_CRON_SECRET`、`STORE_SYNC_APPIDS`、`STEAMSPY_SYNC_CRON_SECRET`。
+
+## 10. Quick Validation Checklist
 - [ ] `npm start` runs successfully.
 - [ ] `/api/steam-profile` returns 200 for valid SteamID.
 - [ ] Steam login redirects back with `steamId` query.
@@ -301,5 +357,11 @@ The project is in a **working but network-sensitive** state with a multi-step UI
 - [ ] 右上角「了解原理」点击后弹出介绍弹窗，含架构与功能说明；可关闭/ Esc / 点击遮罩关闭。
 - [ ] 推荐列表为 3 个场景（热门联机、口味匹配、探索新领域）+ 回坑唤醒，无「每日推荐」场景（由赛博塔罗承担）。
 - [ ] 刷新推荐：有缓存时立即展示再背后请求；无缓存时等待接口后同样触发后台预取；登出/换号清空缓存。
+- [ ] 塔罗每日运势：缓存键含日期，同用户同日同牌同本命游戏，跨日自动更新；不同用户 / 不同日牌与本命游戏不同。
+- [ ] 网络/暂停类错误时展示友好提示并留在 Step 3；切回标签页后自动重试刷新推荐。
 - [ ] Vercel 部署：单 build（server.js + includeFiles public/**），所有请求走 server.js，静态由 serveStatic 从 public/ 提供；推送 Git 后自动部署。
+- [ ] Store 数据层：推荐/塔罗/补全等商店元数据经 storeService.getGamesMeta 批量拉取；日志有 `[store-service] getGamesMeta: requested=… cacheHits=… steamBatches=…`。
 - [ ] `npm run test:e2e` passes (Playwright: auto-hydrate, loader buffer, scenario chip fade).
+- [ ] （可选）`GET /api/cron/sync-store-meta?secret=...` 返回 `requested/synced/failed/steamBatches`；无 secret 时若配置了 STORE_SYNC_CRON_SECRET 则 401。
+- [ ] （可选）`GET /api/cron/sync-steamspy?secret=...` 返回 `success, totalSync, success, fail, elapsedSec`；无 secret 时若配置了 STEAMSPY_SYNC_CRON_SECRET 则 401；无 Redis 时 503。
+- [ ] `GET /api/metrics` 返回 `steamStoreCalls`、`steamSpyCalls`、`cacheHitRate`（0–1）、`lastReset`（时间戳）；统计每日自动重置。

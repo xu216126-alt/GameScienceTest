@@ -283,9 +283,14 @@ const FALLBACK_POOL_RECENCY_MONTHS = 12;
 const STEAMSPY_API_BASE = (process.env.STEAMSPY_API_BASE || 'https://steamspy.com/api.php').replace(/\/$/, '');
 const SESSION_BLACKLIST_KEY_PREFIX = 'steam_sense:session_blacklist:';
 
-// Daily Fortune (塔罗式每日运势): 24h 内同一用户同一张牌、同一运势
+// Daily Fortune (塔罗式每日运势): 按自然日（UTC）区分，同用户同日同牌同本命游戏，跨日即更新
 const DAILY_FORTUNE_KEY_PREFIX = 'steam_sense:daily_fortune:';
 const DAILY_FORTUNE_TTL_SEC = 86400; // 24 hours
+
+/** 当日日期串（UTC），用于塔罗缓存键与抽牌/候选种子，保证每日更新 */
+function getDailyFortuneDateString() {
+  return new Date().toISOString().slice(0, 10);
+}
 
 /**
  * 赛博塔罗牌组：每张牌包含 cardId、中文牌名、静态图片路径。
@@ -454,6 +459,17 @@ async function fetchSteamSpyTopGames(limit = 300) {
   const sorted = [...all].sort((a, b) => b.ratio - a.ratio);
   const seen = new Set();
   return sorted.filter((e) => !seen.has(e.appid) && seen.add(e.appid)).slice(0, limit).map((e) => e.appid);
+}
+
+/** 预留：nightly 同步 store meta 时使用的 top appIds 来源。优先从 env STORE_SYNC_APPIDS 读取（逗号分隔，测试用），否则从 SteamSpy 拉 top N（STORE_META_SYNC_TOP_N，默认 1000）。 */
+const STORE_META_SYNC_TOP_N = Number(process.env.STORE_META_SYNC_TOP_N || 1000);
+async function getSteamSpyTopAppIdsForStoreSync(limit = STORE_META_SYNC_TOP_N) {
+  const fromEnv = process.env.STORE_SYNC_APPIDS;
+  if (fromEnv && typeof fromEnv === 'string') {
+    const ids = fromEnv.split(',').map((s) => Number(s.trim())).filter((id) => Number.isInteger(id) && id > 0);
+    return ids.slice(0, limit);
+  }
+  return fetchSteamSpyTopGames(limit);
 }
 
 /**
@@ -698,25 +714,40 @@ async function getFallbackPoolGamesFromRedis(
     }
     const shuffled = [...shuffleArray(tier1), ...shuffleArray(tier2)];
 
-    const getDetails = typeof getGameDetailsForFallbackTest === 'function' ? getGameDetailsForFallbackTest : getGameDetails;
-    const meta = await Promise.all(
-      shuffled.map(async (entry) => {
+    let meta;
+    if (typeof getGameDetailsForFallbackTest === 'function') {
+      meta = await Promise.all(
+        shuffled.map(async (entry) => {
+          const id = entry.id;
+          if (entry.tags && entry.tags.length > 0) {
+            return { id, primaryGenre: String(entry.tags[0]).trim() || `id-${id}` };
+          }
+          try {
+            const details = await getGameDetailsForFallbackTest(id, 'en-US');
+            const genres = Array.isArray(details?.genres)
+              ? details.genres.map((g) => String(g || '').trim()).filter(Boolean)
+              : [];
+            return { id, primaryGenre: genres[0] || `id-${id}` };
+          } catch {
+            return { id, primaryGenre: `id-${id}` };
+          }
+        })
+      );
+    } else {
+      const idsNeedingMeta = shuffled.filter((e) => !e.tags || e.tags.length === 0).map((e) => e.id);
+      const storeMeta = idsNeedingMeta.length > 0 ? await storeService.getGamesMetaMapCacheOnly(idsNeedingMeta, 'en-US') : new Map();
+      meta = shuffled.map((entry) => {
         const id = entry.id;
         if (entry.tags && entry.tags.length > 0) {
           return { id, primaryGenre: String(entry.tags[0]).trim() || `id-${id}` };
         }
-        try {
-          const details = await getDetails(id, 'en-US');
-          const genres = Array.isArray(details?.genres)
-            ? details.genres.map((g) => String(g || '').trim()).filter(Boolean)
-            : [];
-          const primary = genres[0] || `id-${id}`;
-          return { id, primaryGenre: primary };
-        } catch {
-          return { id, primaryGenre: `id-${id}` };
-        }
-      })
-    );
+        const details = storeMeta.get(id);
+        const genres = Array.isArray(details?.genres)
+          ? details.genres.map((g) => String(g || '').trim()).filter(Boolean)
+          : [];
+        return { id, primaryGenre: genres[0] || `id-${id}` };
+      });
+    }
 
     const preferredSet = new Set(
       (preferredTags || [])
@@ -747,6 +778,17 @@ async function getFallbackPoolGamesFromRedis(
         taken.add(id);
         selected.push(id);
       }
+    }
+
+    if (selected.length > 0 && redisClient) {
+      const steamSpyMeta = await getSteamSpyMetaFromRedis(redisClient, selected);
+      selected.sort((a, b) => {
+        const metaA = steamSpyMeta.get(a);
+        const metaB = steamSpyMeta.get(b);
+        const scoreA = metaA ? scoreService.calculateScore(metaA) : 0;
+        const scoreB = metaB ? scoreService.calculateScore(metaB) : 0;
+        return scoreB - scoreA;
+      });
     }
 
     console.log('[fallback-pool] selected count=', selected.length);
@@ -970,35 +1012,41 @@ const DAILY_FORTUNE_FALLBACK_CACHE = new Map();
 
 async function getDailyFortuneCache(steamId) {
   if (!steamId) return null;
+  const dateStr = getDailyFortuneDateString();
+  const cacheKey = `${DAILY_FORTUNE_KEY_PREFIX}${steamId}:${dateStr}`;
+  const memoryKey = `${steamId}:${dateStr}`;
   if (redisClient && redisHealthy) {
     try {
-      const raw = await redisClient.get(`${DAILY_FORTUNE_KEY_PREFIX}${steamId}`);
+      const raw = await redisClient.get(cacheKey);
       const parsed = parseRedisJson(raw);
       if (parsed) return parsed;
     } catch (err) {
       console.warn('Redis getDailyFortuneCache failed:', err?.message);
     }
   }
-  const hit = DAILY_FORTUNE_FALLBACK_CACHE.get(steamId);
+  const hit = DAILY_FORTUNE_FALLBACK_CACHE.get(memoryKey);
   if (hit && Date.now() - hit.timestamp < DAILY_FORTUNE_TTL_SEC * 1000) return hit.data;
   return null;
 }
 
 async function setDailyFortuneCache(steamId, data) {
   if (!steamId || !data) return;
+  const dateStr = getDailyFortuneDateString();
+  const cacheKey = `${DAILY_FORTUNE_KEY_PREFIX}${steamId}:${dateStr}`;
+  const memoryKey = `${steamId}:${dateStr}`;
   if (redisClient && redisHealthy) {
     try {
-      await redisClient.set(`${DAILY_FORTUNE_KEY_PREFIX}${steamId}`, JSON.stringify(data), { EX: DAILY_FORTUNE_TTL_SEC });
+      await redisClient.set(cacheKey, JSON.stringify(data), { EX: DAILY_FORTUNE_TTL_SEC });
     } catch (err) {
       console.warn('Redis setDailyFortuneCache failed:', err?.message);
     }
   }
-  DAILY_FORTUNE_FALLBACK_CACHE.set(steamId, { timestamp: Date.now(), data });
+  DAILY_FORTUNE_FALLBACK_CACHE.set(memoryKey, { timestamp: Date.now(), data });
 }
 
-/** Deterministic card index for steamId + today (UTC date). Same user same day = same card. */
+/** Deterministic card index for steamId + today (UTC date). Same user same day = same card; different user or day = different card. */
 function pickCardForUser(steamId) {
-  const dateStr = new Date().toISOString().slice(0, 10);
+  const dateStr = getDailyFortuneDateString();
   let hash = 0;
   const str = `${steamId}:${dateStr}`;
   for (let i = 0; i < str.length; i++) hash = ((hash << 5) - hash + str.charCodeAt(i)) | 0;
@@ -1014,28 +1062,27 @@ async function getCandidateGamesForFortune(steamId, lang = 'zh-CN') {
   } catch {
     // ignore
   }
+  const dateStr = getDailyFortuneDateString();
+  const seedHint = `${steamId}:${dateStr}`;
   const fallbackIds = await getFallbackPoolGamesFromRedis(
     ownedAppIds,
     [],
     20,
-    String(steamId),
+    seedHint,
     [],
     'pickles'
   );
   let ids = (fallbackIds || []).map((e) => Number(e)).filter((id) => Number.isInteger(id) && id > 0);
   if (ids.length === 0) ids = [...TRENDING_FALLBACK_POOL].slice(0, 15);
   const unique = [...new Set(ids)].slice(0, 15);
+  const metaMap = await storeService.getGamesMetaMap(unique, lang);
   const candidates = [];
-  await Promise.all(
-    unique.map(async (appId) => {
-      try {
-        const details = await getGameDetailsStrict(appId, lang);
-        if (details && details.name) candidates.push({ appId: details.appId, name: details.name });
-      } catch {
-        // skip
-      }
-    })
-  );
+  for (const appId of unique) {
+    const details = metaMap.get(Number(appId));
+    if (details && details.name && !/^App\s+\d+$/i.test(details.name)) {
+      candidates.push({ appId: details.appId, name: details.name });
+    }
+  }
   return candidates.length > 0 ? candidates : [{ appId: 1145360, name: 'Hades' }];
 }
 
@@ -1353,6 +1400,31 @@ function storeLocaleForLang(lang) {
   }
   return { cc: 'us', l: 'english', currencyLabel: 'USD' };
 }
+
+const storeService = require('./dist/services/storeService');
+const { runSyncSteamSpy } = require('./dist/services/syncSteamSpy');
+const scoreService = require('./dist/services/scoreService');
+const metricsService = require('./dist/services/metricsService');
+
+/** 预留：nightly store meta 同步扩展接口，供 cron 或内部调用。不修改推荐逻辑。 */
+async function syncStoreMeta(appIds) {
+  const ids = Array.isArray(appIds) ? appIds.map((id) => Number(id)).filter((id) => Number.isInteger(id) && id > 0) : [];
+  return storeService.syncStoreMetaToRedis(ids, 'zh-CN');
+}
+
+storeService.init({
+  fetchJson,
+  getRedisClient: () => redisClient,
+  getRedisHealthy: () => redisHealthy,
+  steamStoreBaseUrl: STEAM_STORE_BASE_URL,
+  steamApiBaseUrl: STEAM_API_BASE_URL,
+  steamApiKey: STEAM_API_KEY,
+  storeLocaleForLang,
+  onSteamStoreCall: () => metricsService.recordSteamStoreCall(),
+  onCacheHit: () => metricsService.recordCacheHit(),
+  onCacheMiss: () => metricsService.recordCacheMiss(),
+});
+storeService.setGetTopAppIdsForSyncImpl(getSteamSpyTopAppIdsForStoreSync);
 
 async function getSteamProfileAndGames(steamId, options = {}, lang = 'en-US') {
   if (!STEAM_API_KEY) throw new Error('Missing STEAM_API_KEY in .env');
@@ -2114,6 +2186,59 @@ function buildBacklogFromOwned(profile, forbiddenSet, lang = 'en-US') {
   }));
 }
 
+const STEAM_META_KEY_PREFIX = 'steam_meta:';
+
+/** 仅从 Redis 读取 steam_meta:{appid}，不调用 Steam API。用于统一评分排序。 */
+async function getSteamSpyMetaFromRedis(redis, appIds) {
+  if (!redis || !appIds || appIds.length === 0) return new Map();
+  const unique = [...new Set(appIds.map((id) => Number(id)).filter((id) => Number.isInteger(id) && id > 0))];
+  const results = await Promise.all(unique.map((id) => redis.get(STEAM_META_KEY_PREFIX + id)));
+  const map = new Map();
+  for (let i = 0; i < unique.length; i++) {
+    const raw = results[i];
+    if (raw == null) continue;
+    try {
+      const meta = typeof raw === 'string' ? JSON.parse(raw) : raw;
+      if (meta && Number.isInteger(Number(meta.appid))) map.set(unique[i], meta);
+    } catch (_) {}
+  }
+  return map;
+}
+
+/** 按 scoreService 分数对各场景内游戏排序（仅用本地 SteamSpy 数据，不请求 Steam API）。无 meta 的项排在末尾。 */
+async function sortScenarioGamesByScore(scenarios, redisClient, lang = 'en-US') {
+  if (!scenarios || !redisClient) return scenarios;
+  const fallbackKeys = Object.keys(getFallbackScenariosForLang(lang)).filter((k) => k !== 'backlogReviver' && k !== 'dailyRecommendations');
+  const allAppIds = [];
+  for (const key of fallbackKeys) {
+    const lane = scenarios[key];
+    if (lane && Array.isArray(lane.games)) {
+      for (const g of lane.games) {
+        const id = Number(g?.appId);
+        if (Number.isInteger(id) && id > 0) allAppIds.push(id);
+      }
+    }
+  }
+  if (allAppIds.length === 0) return scenarios;
+  const metaMap = await getSteamSpyMetaFromRedis(redisClient, allAppIds);
+  const scoreByAppId = new Map();
+  for (const [appId, meta] of metaMap) {
+    scoreByAppId.set(appId, scoreService.calculateScore(meta));
+  }
+  const out = { ...scenarios };
+  for (const key of fallbackKeys) {
+    const lane = out[key];
+    if (!lane || !Array.isArray(lane.games)) continue;
+    const games = [...lane.games].sort((a, b) => {
+      const scoreA = scoreByAppId.get(Number(a?.appId)) ?? 0;
+      const scoreB = scoreByAppId.get(Number(b?.appId)) ?? 0;
+      return scoreB - scoreA;
+    });
+    out[key] = { ...lane, games };
+  }
+  return out;
+}
+
 function dedupeAndDiversifyScenarioGames(scenarios, forbiddenAppIds, lang = 'en-US') {
   const forbidden = new Set((forbiddenAppIds || []).map((id) => Number(id)).filter((id) => Number.isInteger(id) && id > 0));
   const globallyUsed = new Set();
@@ -2343,30 +2468,33 @@ function ensureScenarioMinimums(scenarios, forbiddenAppIds, lang = 'en-US') {
   return out;
 }
 
-async function resolvePoolGame(forbiddenSet, lang = 'en-US') {
-  for (const appId of DIVERSITY_APP_POOL) {
-    if (forbiddenSet.has(Number(appId))) continue;
-    try {
-      const details = await getGameDetailsStrict(appId, lang);
-      return {
-        appId: details.appId,
-        name: details.name,
-        mediaType: 'image',
-        media: details.posterImage || details.headerImage,
-        mediaFallback: details.headerImage,
-        positiveRate: details.positiveRate,
-        players: details.currentPlayers,
-        price: details.price,
-        reason: buildMysticalFallbackReason(lang),
-        compatibility: 'playable',
-        handheldCompatibility: 'unknown',
-        destinyLink: buildMysticalFallbackReason(lang),
-        destinyType: 'creative_lineage',
-        destinyScore: 82,
-      };
-    } catch {
-      continue;
-    }
+/** 从已拉取的 store 元数据中选第一个可用池子游戏（供 repair 使用）；若未传 metaMap 则走 storeService 批量拉取。 */
+async function resolvePoolGame(forbiddenSet, lang = 'en-US', metaMap = null) {
+  const candidateIds = DIVERSITY_APP_POOL.filter((id) => !forbiddenSet.has(Number(id)));
+  const map = metaMap != null ? metaMap : await storeService.getGamesMetaMap(candidateIds, lang);
+  for (const appId of candidateIds) {
+    const details = map.get(Number(appId));
+    if (!details) continue;
+    const isGame = String(details.appType || '').toLowerCase() === 'game';
+    const validName = details.name && !/^App\s+\d+$/i.test(details.name);
+    const validMedia = Boolean(details.headerImage);
+    if (!isGame || !validName || !validMedia) continue;
+    return {
+      appId: details.appId,
+      name: details.name,
+      mediaType: 'image',
+      media: details.posterImage || details.headerImage,
+      mediaFallback: details.headerImage,
+      positiveRate: details.positiveRate,
+      players: details.currentPlayers,
+      price: details.price,
+      reason: buildMysticalFallbackReason(lang),
+      compatibility: 'playable',
+      handheldCompatibility: 'unknown',
+      destinyLink: buildMysticalFallbackReason(lang),
+      destinyType: 'creative_lineage',
+      destinyScore: 82,
+    };
   }
   return null;
 }
@@ -2462,6 +2590,9 @@ async function repairEmptyNonBacklogLanes(scenarios, forbiddenAppIds, lang = 'en
     });
   });
 
+  const poolCandidateIds = DIVERSITY_APP_POOL.filter((id) => !forbidden.has(Number(id)) && !used.has(Number(id)));
+  const poolMeta = poolCandidateIds.length > 0 ? await storeService.getGamesMetaMap(poolCandidateIds, lang) : new Map();
+
   const out = {};
   for (const [key, lane] of Object.entries(scenarios || {})) {
     if (key === 'backlogReviver') {
@@ -2472,7 +2603,7 @@ async function repairEmptyNonBacklogLanes(scenarios, forbiddenAppIds, lang = 'en
     const minPerLane = 3;
     const maxPerLane = 5;
     while (games.length < minPerLane) {
-      const candidate = await resolvePoolGame(new Set([...forbidden, ...used]), lang);
+      const candidate = await resolvePoolGame(new Set([...forbidden, ...used]), lang, poolMeta);
       if (!candidate) break;
       used.add(Number(candidate.appId));
       games.push(candidate);
@@ -2532,6 +2663,7 @@ function buildLocalFallbackAnalysis(profile, deviceProfile, lang = 'en-US') {
 }
 
 async function enrichScenariosWithStoreData(scenarios, forbiddenAppIds = [], lang = 'en-US', options = {}) {
+  const cacheOnly = options.cacheOnly === true;
   const enriched = {};
   const used = new Set();
   const hardForbidden = new Set(
@@ -2540,8 +2672,8 @@ async function enrichScenariosWithStoreData(scenarios, forbiddenAppIds = [], lan
   const alternatePool = Array.isArray(options.alternatePool)
     ? options.alternatePool.map((id) => Number(id)).filter((id) => Number.isInteger(id) && id > 0)
     : [];
-  const prefetchIds = new Set();
 
+  const prefetchIds = new Set();
   for (const [key, lane] of Object.entries(scenarios || {})) {
     for (const g of lane.games || []) {
       const appId = Number(g.appId);
@@ -2550,50 +2682,45 @@ async function enrichScenariosWithStoreData(scenarios, forbiddenAppIds = [], lan
       prefetchIds.add(appId);
     }
   }
+  const allAppIds = [...prefetchIds];
+  alternatePool.forEach((id) => allAppIds.push(id));
+  const prefetchedDetails = cacheOnly
+    ? await storeService.getGamesMetaMapCacheOnly(allAppIds, lang)
+    : await storeService.getGamesMetaMap(allAppIds, lang);
 
-  const prefetchedDetails = new Map();
-  await Promise.all(
-    [...prefetchIds].map(async (appId) => {
-      try {
-        const details = await getGameDetailsStrictWithRetry(appId, lang, 2, 600);
-        prefetchedDetails.set(appId, details);
-      } catch {
-        // 预取失败，后面会尝试备用池替换或占位
-      }
-    })
-  );
+  const toGameEntry = (details, g, useNewReleaseReason) => {
+    const releaseDate = details.releaseDate || '';
+    const newRelease = isNewRelease(releaseDate);
+    const reason = useNewReleaseReason && newRelease ? buildNewReleaseReason(lang) : (g.reason || '');
+    return {
+      appId: details.appId,
+      name: details.name,
+      mediaType: 'image',
+      media: details.posterImage || details.headerImage,
+      mediaFallback: details.headerImage,
+      positiveRate: details.positiveRate,
+      players: details.currentPlayers,
+      price: details.price,
+      releaseDate,
+      isNewRelease: newRelease,
+      reason,
+      compatibility: g.compatibility || 'playable',
+      handheldCompatibility: g.handheldCompatibility || 'unknown',
+      destinyLink: g.destinyLink || '',
+      destinyType: g.destinyType || 'philosophical_echoes',
+      destinyScore: Number.isFinite(Number(g.destinyScore)) ? Math.max(0, Math.min(100, Math.round(Number(g.destinyScore)))) : 0,
+      fromLibrary: Boolean(g.fromLibrary),
+    };
+  };
 
-  const tryAlternateForSlot = async (g, key) => {
+  const tryAlternateForSlot = (g, key) => {
     const shouldSkipForbidden = key !== 'backlogReviver';
     for (const altId of alternatePool) {
       if (used.has(altId) || (shouldSkipForbidden && hardForbidden.has(altId))) continue;
-      try {
-        const details = await getGameDetailsStrictWithRetry(altId, lang, 2, 600);
+      const details = prefetchedDetails.get(altId);
+      if (details) {
         used.add(altId);
-        const releaseDate = details.releaseDate || '';
-        const newRelease = isNewRelease(releaseDate);
-        const reason = newRelease ? buildNewReleaseReason(lang) : (g.reason || '');
-        return {
-          appId: details.appId,
-          name: details.name,
-          mediaType: 'image',
-          media: details.posterImage || details.headerImage,
-          mediaFallback: details.headerImage,
-          positiveRate: details.positiveRate,
-          players: details.currentPlayers,
-          price: details.price,
-          releaseDate,
-          isNewRelease: newRelease,
-          reason,
-          compatibility: g.compatibility || 'playable',
-          handheldCompatibility: g.handheldCompatibility || 'unknown',
-          destinyLink: g.destinyLink || '',
-          destinyType: g.destinyType || 'philosophical_echoes',
-          destinyScore: Number.isFinite(Number(g.destinyScore)) ? Math.max(0, Math.min(100, Math.round(Number(g.destinyScore)))) : 0,
-          fromLibrary: Boolean(g.fromLibrary),
-        };
-      } catch {
-        continue;
+        return toGameEntry(details, g, true);
       }
     }
     return null;
@@ -2605,36 +2732,17 @@ async function enrichScenariosWithStoreData(scenarios, forbiddenAppIds = [], lan
       const appId = Number(g.appId);
       const shouldSkipForbidden = key !== 'backlogReviver';
       if (!Number.isInteger(appId) || appId <= 0 || used.has(appId) || (shouldSkipForbidden && hardForbidden.has(appId))) continue;
-      let details = prefetchedDetails.get(appId);
+      const details = prefetchedDetails.get(appId);
       used.add(appId);
       if (details) {
-        const releaseDate = details.releaseDate || '';
-        const newRelease = isNewRelease(releaseDate);
-        const reason = newRelease ? buildNewReleaseReason(lang) : (g.reason || '');
-        games.push({
-          appId: details.appId,
-          name: details.name,
-          mediaType: 'image',
-          media: details.posterImage || details.headerImage,
-          mediaFallback: details.headerImage,
-          positiveRate: details.positiveRate,
-          players: details.currentPlayers,
-          price: details.price,
-          releaseDate,
-          isNewRelease: newRelease,
-          reason,
-          compatibility: g.compatibility || 'playable',
-          handheldCompatibility: g.handheldCompatibility || 'unknown',
-          destinyLink: g.destinyLink || '',
-          destinyType: g.destinyType || 'philosophical_echoes',
-          destinyScore: Number.isFinite(Number(g.destinyScore)) ? Math.max(0, Math.min(100, Math.round(Number(g.destinyScore)))) : 0,
-          fromLibrary: Boolean(g.fromLibrary),
-        });
+        games.push(toGameEntry(details, g, true));
       } else {
         used.delete(appId);
-        const substituted = await tryAlternateForSlot(g, key);
+        const substituted = tryAlternateForSlot(g, key);
         if (substituted) {
           games.push(substituted);
+        } else if (cacheOnly) {
+          // fallback 阶段：Redis 无 store meta 则直接跳过该游戏，不请求 Steam、不展示占位
         } else {
           used.add(appId);
           games.push({
@@ -2659,7 +2767,6 @@ async function enrichScenariosWithStoreData(scenarios, forbiddenAppIds = [], lan
         }
       }
     }
-
     enriched[key] = {
       title: lane.title,
       description: lane.description,
@@ -2743,6 +2850,21 @@ const server = http.createServer(async (req, res) => {
     const requestUrl = new URL(req.url, buildOrigin(req));
     const pathname = requestUrl.pathname;
 
+    if (pathname === '/api/metrics' && req.method === 'GET') {
+      try {
+        const snapshot = metricsService.getMetrics();
+        sendJson(res, 200, {
+          steamStoreCalls: snapshot.steamStoreCalls,
+          steamSpyCalls: snapshot.steamSpyCalls,
+          cacheHitRate: snapshot.cacheHitRate,
+          lastReset: snapshot.lastReset,
+        });
+      } catch (err) {
+        sendJson(res, 500, { error: err?.message || String(err) });
+      }
+      return;
+    }
+
     if (pathname === '/api/health' && req.method === 'GET') {
       const steamConfigured = Boolean(STEAM_API_KEY);
       const redisConfigured = Boolean(REDIS_URL) || Boolean(UPSTASH_REDIS_REST_URL && UPSTASH_REDIS_REST_TOKEN);
@@ -2798,6 +2920,70 @@ const server = http.createServer(async (req, res) => {
         await refreshFallbackPoolFromSteam();
         sendJson(res, 200, { success: true, message: 'Pool refreshed' });
       } catch (err) {
+        sendJson(res, 500, { success: false, error: err?.message || String(err) });
+      }
+      return;
+    }
+
+    // Nightly：SteamSpy 数据同步，写入 steam_meta:{appid}；不修改推荐逻辑。
+    if (pathname === '/api/cron/sync-steamspy' && req.method === 'GET') {
+      const cronSecret = process.env.STEAMSPY_SYNC_CRON_SECRET || process.env.CRON_SECRET;
+      if (cronSecret && requestUrl.searchParams.get('secret') !== cronSecret) {
+        sendJson(res, 401, { success: false, error: 'Unauthorized' });
+        return;
+      }
+      if (!redisClient || !redisHealthy) {
+        sendJson(res, 503, { success: false, error: 'Redis unavailable' });
+        return;
+      }
+      try {
+        const steamSpyBaseUrl = (process.env.STEAMSPY_BASE_URL || 'https://steamspy.com').replace(/\/$/, '');
+        const steamSpyCacheTtl = Number(process.env.STEAMSPY_CACHE_TTL || 7 * 24 * 3600);
+        const steamSpyMaxPages = Math.max(1, Math.min(100, Number(process.env.STEAMSPY_SYNC_MAX_PAGES) || 20));
+        const steamSpySkipHours = Math.max(0, Number(process.env.STEAMSPY_SKIP_PAGE_WITHIN_HOURS) ?? 24);
+        const result = await runSyncSteamSpy({
+          redis: redisClient,
+          fetchJson: (url) =>
+            fetchJson(url).then((data) => {
+              metricsService.recordSteamSpyCall();
+              return data;
+            }),
+          steamSpyBaseUrl,
+          steamSpyCacheTtlSec: steamSpyCacheTtl,
+          maxPages: steamSpyMaxPages,
+          skipPageWithinHours: steamSpySkipHours,
+        });
+        sendJson(res, 200, { success: true, message: 'SteamSpy sync completed', ...result });
+      } catch (err) {
+        console.warn('[cron/sync-steamspy]', err?.message || err);
+        sendJson(res, 500, { success: false, error: err?.message || String(err) });
+      }
+      return;
+    }
+
+    // 预留：nightly cron 每日凌晨从 SteamSpy 抓 top 1000，批量同步 store meta 到 Redis；推荐阶段只读本地，Steam API 仅补缺失。
+    if (pathname === '/api/cron/sync-store-meta' && req.method === 'GET') {
+      const cronSecret = process.env.STORE_SYNC_CRON_SECRET || process.env.CRON_SECRET;
+      if (cronSecret && requestUrl.searchParams.get('secret') !== cronSecret) {
+        sendJson(res, 401, { success: false, error: 'Unauthorized' });
+        return;
+      }
+      try {
+        const appIds = await getSteamSpyTopAppIdsForStoreSync(STORE_META_SYNC_TOP_N);
+        if (appIds.length === 0) {
+          sendJson(res, 200, { success: true, message: 'No appIds to sync (set STORE_SYNC_APPIDS or enable SteamSpy)', synced: 0 });
+          return;
+        }
+        const lang = normalizeLang(requestUrl.searchParams.get('lang') || 'zh-CN');
+        const result = await storeService.syncStoreMetaToRedis(appIds, lang);
+        sendJson(res, 200, {
+          success: true,
+          message: 'Store meta sync completed',
+          requested: appIds.length,
+          ...result,
+        });
+      } catch (err) {
+        console.warn('[cron/sync-store-meta]', err?.message || err);
         sendJson(res, 500, { success: false, error: err?.message || String(err) });
       }
       return;
@@ -3032,8 +3218,10 @@ const server = http.createServer(async (req, res) => {
         }
       }
       const nonOwnedScenarios = keepNonOwnedScenarioGames(aiOutput.scenarios, profile.ownedAppIds, lang);
+      // 排序仅用本地 SteamSpy 数据（steam_meta:*），不请求 Steam API
+      const scoredScenarios = await sortScenarioGamesByScore(nonOwnedScenarios, redisClient, lang);
       const diversified = dedupeAndDiversifyScenarioGames(
-        nonOwnedScenarios,
+        scoredScenarios,
         [...profile.ownedAppIds, ...recentRecommendedAppIds, ...mergedExcludedSessionAppIds],
         lang
       );
@@ -3061,8 +3249,11 @@ const server = http.createServer(async (req, res) => {
         repairedNonOwned,
         [...recentRecommendedAppIds, ...mergedExcludedSessionAppIds],
         lang,
-        { alternatePool: [...TRENDING_FALLBACK_POOL] }
+        { alternatePool: [...TRENDING_FALLBACK_POOL], cacheOnly: usedFallback }
       );
+      if (usedFallback) {
+        console.log('[ai-analysis] fallback 阶段是否触发 Steam 请求: 否 (steamBatches=0，仅读本地缓存)');
+      }
       // Only repair empty lanes when AI provider succeeded.
       // Do not inject pool picks in local fallback mode.
       const repairedScenarios = usedFallback
@@ -3184,8 +3375,9 @@ const server = http.createServer(async (req, res) => {
           rescueFilled,
           [...recentRecommendedAppIds, ...mergedExcludedSessionAppIds],
           lang,
-          { alternatePool: rescueAlternatePool }
+          { alternatePool: rescueAlternatePool, cacheOnly: true }
         );
+        console.log('[ai-analysis] rescue 阶段是否触发 Steam 请求: 否 (steamBatches=0，仅读本地缓存)');
       }
 
       // Session blacklist update: add all newly surfaced appIds (from final response) so refresh avoids them.
@@ -3252,7 +3444,11 @@ const server = http.createServer(async (req, res) => {
           return;
         }
         const { fortune, appId } = await callAiForDailyFortune(card.cardName, activityDiff, candidates, lang);
-        const details = await getGameDetailsStrict(appId, lang);
+        const metaMap = await storeService.getGamesMetaMap([appId], lang);
+        const details = metaMap.get(Number(appId));
+        if (!details || !details.name || /^App\s+\d+$/i.test(details.name)) {
+          throw new Error('Daily fortune game details unavailable');
+        }
         const game = {
           appId: details.appId,
           name: details.name,
@@ -3290,15 +3486,11 @@ const server = http.createServer(async (req, res) => {
         .filter((id) => Number.isInteger(id) && id > 0)
         .slice(0, 20);
       if (appIds.length === 0) return sendJson(res, 400, { error: 'Missing or invalid appIds (comma-separated, max 20).' });
+      const metaMap = await storeService.getGamesMetaMap(appIds, lang);
       const results = {};
-      await Promise.all(
-        appIds.map(async (appId) => {
-          try {
-            const d = await getGameDetails(appId, lang);
-            if (d && d.name && !/^App\s+\d+$/i.test(d.name)) results[String(appId)] = d;
-          } catch (_) {}
-        })
-      );
+      metaMap.forEach((d, id) => {
+        if (d && d.name && !/^App\s+\d+$/i.test(d.name)) results[String(id)] = d;
+      });
       sendJson(res, 200, results);
       return;
     }
@@ -3308,7 +3500,8 @@ const server = http.createServer(async (req, res) => {
       const lang = normalizeLang(requestUrl.searchParams.get('lang') || 'en-US');
       if (!/^\d+$/.test(appId)) return sendJson(res, 400, { error: 'Invalid app ID.' });
 
-      const details = await getGameDetails(appId, lang).catch(() => ({
+      const metaMap = await storeService.getGamesMetaMap([Number(appId)], lang);
+      const details = metaMap.get(Number(appId)) || ({
         appId: Number(appId),
         name: `App ${appId}`,
         headerImage: `https://cdn.akamai.steamstatic.com/steam/apps/${appId}/header.jpg`,
@@ -3322,7 +3515,7 @@ const server = http.createServer(async (req, res) => {
         positiveRate: 'N/A',
         currentPlayers: 'N/A',
         steamUrl: `https://store.steampowered.com/app/${appId}`,
-      }));
+      });
       sendJson(res, 200, details);
       return;
     }
@@ -3383,6 +3576,7 @@ module.exports.addToSessionBlacklist = addToSessionBlacklist;
 module.exports.getSessionBlacklist = getSessionBlacklist;
 module.exports.setGetGameDetailsForFallbackTest = setGetGameDetailsForFallbackTest;
 module.exports.seedFallbackPoolV2ForTest = seedFallbackPoolV2ForTest;
+module.exports.syncStoreMeta = syncStoreMeta;
 module.exports.getRedisReadyPromise = getRedisReadyPromise;
 module.exports.callAiForAnalysis = callAiForAnalysis;
 module.exports.setRequestCompletionForTest = setRequestCompletionForTest;
