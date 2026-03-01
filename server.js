@@ -143,7 +143,12 @@ try {
 function createUpstashRedisAdapter(upstash) {
   return {
     get: (key) => upstash.get(key),
-    set: (key, value, opts) => upstash.set(key, value, opts && opts.EX != null ? { ex: opts.EX } : undefined),
+    set: (key, value, opts) => {
+      const options = {};
+      if (opts && opts.EX != null) options.ex = opts.EX;
+      if (opts && opts.NX) options.nx = true;
+      return upstash.set(key, value, Object.keys(options).length ? options : undefined);
+    },
     del: (key) => upstash.del(key),
     sAdd: (key, ...args) => {
       const members = Array.isArray(args[0]) ? args[0] : args;
@@ -1449,6 +1454,37 @@ storeService.init({
 });
 storeService.setGetTopAppIdsForSyncImpl(getSteamSpyTopAppIdsForStoreSync);
 
+const STEAMSPY_TRIGGER_KEY = 'steam_sense:steamspy_sync_triggered_at';
+const STEAMSPY_TRIGGER_TTL_SEC = 6 * 3600; // 6h 内只触发一次
+
+/** 部署后首次打开网站时触发一次 sync-steamspy，便于线上测试不等到 0 点；Redis NX 保证 6h 内只跑一次。 */
+async function triggerSteamSpySyncOnFirstVisit() {
+  if (!redisClient || !redisHealthy) return;
+  try {
+    const setOk = await redisClient.set(STEAMSPY_TRIGGER_KEY, String(Date.now()), { NX: true, EX: STEAMSPY_TRIGGER_TTL_SEC });
+    if (!setOk) return;
+    const steamSpyBaseUrl = (process.env.STEAMSPY_BASE_URL || 'https://steamspy.com').replace(/\/$/, '');
+    const steamSpyCacheTtl = Number(process.env.STEAMSPY_CACHE_TTL || 7 * 24 * 3600);
+    const steamSpyMaxPages = Math.max(1, Math.min(100, Number(process.env.STEAMSPY_SYNC_MAX_PAGES) || 20));
+    const steamSpySkipHours = Math.max(0, Number(process.env.STEAMSPY_SKIP_PAGE_WITHIN_HOURS) ?? 24);
+    await runSyncSteamSpy({
+      redis: redisClient,
+      fetchJson: (url) =>
+        fetchJson(url).then((data) => {
+          metricsService.recordSteamSpyCall();
+          return data;
+        }),
+      steamSpyBaseUrl,
+      steamSpyCacheTtlSec: steamSpyCacheTtl,
+      maxPages: steamSpyMaxPages,
+      skipPageWithinHours: steamSpySkipHours,
+    });
+    console.log('[steamspy-trigger] sync-steamspy completed after first visit');
+  } catch (err) {
+    console.warn('[steamspy-trigger]', err?.message || err);
+  }
+}
+
 async function getSteamProfileAndGames(steamId, options = {}, lang = 'en-US') {
   if (!STEAM_API_KEY) throw new Error('Missing STEAM_API_KEY in .env');
   const allowSummaryFallback = options.allowSummaryFallback !== false;
@@ -2711,6 +2747,12 @@ async function enrichScenariosWithStoreData(scenarios, forbiddenAppIds = [], lan
     ? await storeService.getGamesMetaMapCacheOnly(allAppIds, lang)
     : await storeService.getGamesMetaMap(allAppIds, lang);
 
+  const missingFromStore = [...prefetchIds].filter((id) => !prefetchedDetails.get(id));
+  let steamSpyMeta = new Map();
+  if (missingFromStore.length > 0 && redisClient) {
+    steamSpyMeta = await getSteamSpyMetaFromRedis(redisClient, missingFromStore);
+  }
+
   const toGameEntry = (details, g, useNewReleaseReason) => {
     const releaseDate = details.releaseDate || '';
     const newRelease = isNewRelease(releaseDate);
@@ -2768,13 +2810,21 @@ async function enrichScenariosWithStoreData(scenarios, forbiddenAppIds = [], lan
           // fallback 阶段：Redis 无 store meta 则直接跳过该游戏，不请求 Steam、不展示占位
         } else {
           used.add(appId);
+          const spyMeta = steamSpyMeta.get(appId);
+          const name = spyMeta?.name && !/^App\s+\d+$/i.test(String(spyMeta.name))
+            ? String(spyMeta.name).trim()
+            : `App ${appId}`;
+          const pos = Number(spyMeta?.positive) || 0;
+          const neg = Number(spyMeta?.negative) || 0;
+          const total = pos + neg;
+          const positiveRate = total > 0 ? `${Math.round((pos / total) * 100)}%` : '';
           games.push({
             appId,
-            name: `App ${appId}`,
+            name,
             mediaType: 'image',
             media: `https://cdn.akamai.steamstatic.com/steam/apps/${appId}/library_600x900.jpg`,
             mediaFallback: `https://cdn.akamai.steamstatic.com/steam/apps/${appId}/header.jpg`,
-            positiveRate: '',
+            positiveRate,
             players: '',
             price: '',
             releaseDate: '',
@@ -2872,6 +2922,10 @@ const server = http.createServer(async (req, res) => {
   try {
     const requestUrl = new URL(req.url, buildOrigin(req));
     const pathname = requestUrl.pathname;
+
+    if (pathname === '/' && req.method === 'GET' && redisClient && redisHealthy) {
+      triggerSteamSpySyncOnFirstVisit().catch(() => {});
+    }
 
     if (pathname === '/api/metrics' && req.method === 'GET') {
       try {
