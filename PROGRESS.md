@@ -1,7 +1,7 @@
 # SteamSense AI - Progress Handoff (2026-03-01)
 
 ## 1. Current Status
-The project is in a **working but network-sensitive** state with a multi-step UI flow. The UI is **Chinese-only** (no language toggle). AI prompts and API continue to support `lang`; frontend always sends `zh-CN`. **Vercel 部署**：静态资源已改为通过 `public/` 目录由 Vercel 静态构建提供，首页与静态文件不再经 serverless 函数，避免出现 `{"error":"Not found"}`；推送 Git 后自动部署。**数据源说明**：游戏详情（名称、价格、海报、好评率等）来自 Steam 商店 API（非公开、易限流）；在线人数来自 Steam Web API。兜底池可来自 Steam 商店新品搜索 + SteamSpy；若 SteamSpy 不可用，实际降级主要依赖本地缓存、`fallback_games.json` 与代码内硬编码池（如 `TRENDING_FALLBACK_POOL`）。**Store 数据层**：已引入独立模块 `storeService.js`，负责批量请求 Steam appdetails、Redis 缓存与并发限制，单次推荐流程最多 1–2 次 Steam Store 批量请求，已缓存游戏不再请求 Steam，限流风险显著下降（见 §2.27）。**Nightly 同步**：已增加 `GET /api/cron/sync-steamspy` 与 `services/syncSteamSpy.ts`（SteamSpy 数据写入 `steam_meta:{appid}`）；当前为**串行执行**、每请求间隔 2s、429/503/500/「Too many connections」指数退避（2s→4s→8s）、**每日**同步 top100in2weeks + top100forever + top100owned + **2 页 all**（约 10 天建全库）、Upstash 下 **pipeline 批量写入**、24h 幂等；遇 Cloudflare 403 可配置 `STEAMSPY_PROXY_URL`（见 §2.28、§2.31）。**统一评分**：`services/scoreService.ts` 基于本地 SteamSpy 数据计算 0–100 分，推荐候选池与场景内游戏按分数排序，不依赖 Steam 排序（见 §2.29）。**API 监控**：`services/metricsService.ts` 统计 Steam Store / SteamSpy 调用与缓存命中率，`GET /api/metrics` 返回当日统计，每日自动重置（见 §2.30）。**Redis 批量与并发**：Upstash 适配器支持 `mget`，`getSteamSpyMetaFromRedis` 与 storeService 缓存读取均优先单次 mget，Steam 缺失批次用 Promise.all 并发请求（见 §2.27、§2.32）。**Step 3 推荐填充**：首包采用 preflight（仅 steam_meta 单次 mget，不等待 Store），头图统一硬编码 CDN（`shared.fastly.steamstatic.com/.../header.jpg`），有 steam_meta 即展示、无则最小卡，绝不空卡（见 §2.32）。
+The project is in a **working but network-sensitive** state with a multi-step UI flow. The UI is **Chinese-only** (no language toggle). AI prompts and API continue to support `lang`; frontend always sends `zh-CN`. **Vercel 部署**：静态资源已改为通过 `public/` 目录由 Vercel 静态构建提供，首页与静态文件不再经 serverless 函数，避免出现 `{"error":"Not found"}`；推送 Git 后自动部署。**数据源说明**：游戏详情（名称、价格、海报、好评率等）来自 Steam 商店 API（非公开、易限流）；在线人数来自 Steam Web API。兜底池可来自 Steam 商店新品搜索 + SteamSpy；若 SteamSpy 不可用，实际降级主要依赖本地缓存、`fallback_games.json` 与代码内硬编码池（如 `TRENDING_FALLBACK_POOL`）。**Store 数据层**：已引入独立模块 `storeService.js`，负责批量请求 Steam appdetails、Redis 缓存与并发限制，单次推荐流程最多 1–2 次 Steam Store 批量请求，已缓存游戏不再请求 Steam，限流风险显著下降（见 §2.27）。**Nightly 同步**：已增加 `GET /api/cron/sync-steamspy` 与 `services/syncSteamSpy.ts`（SteamSpy 数据写入 `steam_meta:{appid}`）；当前为**串行执行**、每请求间隔 2s、429/503/500/「Too many connections」指数退避（2s→4s→8s）、**每日**同步 top100in2weeks + top100forever + top100owned + **2 页 all**（约 10 天建全库）、Upstash 下 **pipeline 批量写入**、24h 幂等；遇 Cloudflare 403 可配置 `STEAMSPY_PROXY_URL`（见 §2.28、§2.31）。**统一评分**：`services/scoreService.ts` 基于本地 SteamSpy 数据计算 0–100 分，推荐候选池与场景内游戏按分数排序，不依赖 Steam 排序（见 §2.29）。**API 监控**：`services/metricsService.ts` 统计 Steam Store / SteamSpy 调用与缓存命中率，`GET /api/metrics` 返回当日统计，每日自动重置（见 §2.30）。**Redis 批量与并发**：Upstash 适配器支持 `mget`，`getSteamSpyMetaFromRedis` 与 storeService 缓存读取均优先单次 mget，Steam 缺失批次用 Promise.all 并发请求（见 §2.27、§2.32）。**Step 3 推荐填充**：首包采用 preflight（仅 steam_meta 单次 mget，不等待 Store），头图统一硬编码 CDN（`shared.fastly.steamstatic.com/.../header.jpg`），有 steam_meta 即展示、无则最小卡，绝不空卡（见 §2.32）。**列表展示**：分析/刷新完成后先置 `isAnalyzing = false` 再调 `applyAiResult`，保证首次 `renderRecommendations` 即绘制卡片而非 loading；占位卡（`Unknown Game`/`未知命运`/`App ${id}`）在 0/3/8s 触发 `game-details-batch` 补全，补全时若 batch 返回仍为占位名则不覆盖标题，避免「先正常后变 Unknown」（见 §2.33）。
 
 ## 2. Implemented Features
 
@@ -67,7 +67,7 @@ The project is in a **working but network-sensitive** state with a multi-step UI
   - Cycles scenario angles to increase variety.
 - **刷新缓存机制**：首次分析或每次刷新成功后，后台静默预取一组「下一轮刷新」结果写入 `refreshCache`；用户点刷新时**仅当缓存通过校验**（每场景至少 3 款、与当前展示重叠 ≤40%）才先展示缓存并背后再请求，否则走正常请求；预取结果也仅在通过同样校验时才写入缓存，避免「同一批游戏换场景」的观感。登出或切换 Steam 账号时清空缓存。见 §2.26。
 - **会话黑名单与跨场景去重**：后端将本次返回的全部推荐 appId 写入会话黑名单（Redis/内存），刷新与预取请求均携带前端 `excludedAppIds` 并与服务端黑名单合并，严禁再次推荐；响应前对场景做 `dedupeScenariosGlobally`，保证同一款游戏只出现在一个场景中，避免「同一游戏在不同场景间来回出现」。
-- **兜底占位卡片与商店拉取失败**：推荐流程统一经 **storeService.getGamesMeta** 批量拉取商店元数据（先 Redis 缓存、缺失再请求 Steam，见 §2.27）；若某款游戏在批量结果中缺失，`enrichScenariosWithStoreData` 从 `alternatePool`（主流程传 `TRENDING_FALLBACK_POOL`，救急填充传 rescue 候选 + TRENDING_FALLBACK_POOL）中尝试替换为其他 appId（同批 meta 已含 alternatePool，无需再请求）。前端对仍为占位的卡片（`game-card--placeholder`）在 0ms、3s、8s 调用 `GET /api/game-details-batch?appIds=...` 拉取详情并原地更新标题、封面、价格、指标；「查看详情」按钮从当前卡片 DOM 读标题，保证补全后名称正确。
+- **兜底占位卡片与商店拉取失败**：推荐流程统一经 **storeService.getGamesMeta** 批量拉取商店元数据（先 Redis 缓存、缺失再请求 Steam，见 §2.27）；若某款游戏在批量结果中缺失，`enrichScenariosWithStoreData` 从 `alternatePool` 中尝试替换。前端仅对 **name 为 `App ${id}` / `Unknown Game` / `未知命运`** 的卡片加 `game-card--placeholder`，在 0/3/8s 调 `GET /api/game-details-batch` 补全；补全时若 batch 返回名称仍为占位名则**不覆盖**标题与 placeholder 类，避免已正确显示的名字被覆盖成 Unknown Game（见 §2.33）。
 
 ### 2.6 Localization (Chinese-only)
 - **Language toggle removed.** All UI and visible content are **Chinese only** (`zh-CN`). Frontend uses `currentLang = "zh-CN"` and `t()` reads only from `translations["zh-CN"]`.
@@ -239,6 +239,11 @@ The project is in a **working but network-sensitive** state with a multi-step UI
 - **Preflight 首包**：主路径 `enrichScenariosWithStoreData(..., { preflight: true })` 时仅调 **getGamesMetaMapSteamSpyOnly(allAppIds)**（单次 mget steam_meta + 无数据时最小卡），**不请求 Steam Store**，AI 摘要与推荐列表（名称 + ID + 头图 URL）尽快返回；前端可对价格等显示「Loading details…」再通过 `/api/game-details-batch` 补全。
 - **智能兜底**：有 `steam_meta` 即用其 name + CDN 图展示；无 steam_meta 的 appId 仍写入最小卡（`App ${id}` + 同一 CDN 图）；Store 429 或缺失时也保证有 steam_meta 则展示、无则最小卡，**绝不出现空卡**。Rescue 占位卡同样使用 `STEAM_HEADER_CDN(appId)`。
 
+### 2.33 Step 3 列表展示与占位补全（前端）
+- **isAnalyzing 顺序**：分析或刷新请求返回后，**先**设 `isAnalyzing = false` **再**调用 `applyAiResult(ai, ...)`，这样 `applyAiResult` 内首次 `renderRecommendations` 时不会因 `isAnalyzing === true` 直接走 loading 并 return，列表能立即绘制卡片（解决「列表不显示」）。
+- **占位判定**：仅当卡片 `name` 为 `App ${appId}`、`Unknown Game` 或 `未知命运` 时加 `game-card--placeholder` 并参与 `scheduleEnrichPlaceholderCards`（0/3/8s 调 `/api/game-details-batch`）；不按「好评率为 N/A」当作占位，避免有真实名称的卡片被误补全。
+- **补全不覆盖**：`enrichPlaceholderCards` 收到 batch 后，若某条 `displayName` 仍为占位名（空、`Unknown Game`、`未知命运`、`App ${appId}`），则**不更新**该卡片的标题、也不移除 `game-card--placeholder`，仅更新图片/价格/指标；避免「先正常显示、几秒后变 Unknown Game」的覆盖问题。
+
 ## 3. Key Files
 - Frontend (开发): `index.html`, `styles.css`, `script.js`（根目录）
 - Frontend (Vercel 静态): `public/index.html`, `public/styles.css`, `public/script.js`, `public/images/`
@@ -359,7 +364,7 @@ The project is in a **working but network-sensitive** state with a multi-step UI
 - [ ] On second visit with changed recent play data, `activityDiff` is present and AI summary mentions recent activity.
 - [ ] `GET /api/health` returns `redis.healthy` and `aiProviders.*.circuitOpen` / `failures`.
 - [ ] Scenario chips (碎片时间 / 沉浸时光) live in tactical filter bar above recommendations; click applies scale animation and grid fade; switching scenario immediately refetches analysis and updates recommendations (no extra Refresh click).
-- [ ] Step 3 loader shows at least 3s; then summary and cards appear with staggered card animation.
+- [ ] Step 3 loader shows at least 3s; then summary and cards appear with staggered card animation；分析/刷新返回后列表立即显示名称与头图（isAnalyzing 先置 false 再 applyAiResult，见 §2.33）；占位卡（Unknown Game/未知命运）经 game-details-batch 补全，补全时占位名不覆盖已有正确名称。
 - [ ] If fallback was used, “进一步占卜中” appears; “获取深度预言” may appear after background retry.
 - [ ] Games released in last 90 days show “热门新品” badge (top-left) and the rising-star reason copy.
 - [ ] Recommendation cards do **not** show destiny link on the card; “查看详情” modal shows both 推荐理由 and 命运链接 (when present).
