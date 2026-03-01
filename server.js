@@ -2853,20 +2853,25 @@ async function enrichScenariosWithStoreData(scenarios, forbiddenAppIds = [], lan
   }
 
   const toGameEntry = (details, g, useNewReleaseReason) => {
+    const appId = Number(details.appId);
     const releaseDate = details.releaseDate || '';
     const newRelease = isNewRelease(releaseDate);
     const reason = useNewReleaseReason && newRelease ? buildNewReleaseReason(lang) : (g.reason || '');
-    const headerUrl = details.headerImage || STEAM_HEADER_CDN(details.appId);
-    const mediaUrl = details.posterImage || details.headerImage || headerUrl;
+    const headerUrl = details.headerImage || details.header_image || STEAM_HEADER_CDN(appId);
+    const mediaUrl = details.posterImage || details.headerImage || details.header_image || headerUrl;
+    const name = (details.name && !/^App\s+\d+$/i.test(String(details.name)))
+      ? String(details.name).trim()
+      : (lang === 'zh-CN' ? '未知命运' : 'Unknown Game');
     return {
-      appId: details.appId,
-      name: details.name,
+      appId,
+      name,
       mediaType: 'image',
       media: mediaUrl,
       mediaFallback: headerUrl,
-      positiveRate: details.positiveRate,
-      players: details.currentPlayers,
-      price: details.price,
+      headerImage: headerUrl,
+      positiveRate: details.positiveRate ?? '',
+      players: details.currentPlayers ?? '',
+      price: details.price ?? '',
       releaseDate,
       isNewRelease: newRelease,
       reason,
@@ -2912,7 +2917,8 @@ async function enrichScenariosWithStoreData(scenarios, forbiddenAppIds = [], lan
           const spyMeta = steamSpyMeta.get(appId);
           const name = spyMeta?.name && !/^App\s+\d+$/i.test(String(spyMeta.name))
             ? String(spyMeta.name).trim()
-            : `App ${appId}`;
+            : (lang === 'zh-CN' ? '未知命运' : 'Unknown Game');
+          const headerUrl = STEAM_HEADER_CDN(appId);
           const pos = Number(spyMeta?.positive) || 0;
           const neg = Number(spyMeta?.negative) || 0;
           const total = pos + neg;
@@ -2921,11 +2927,12 @@ async function enrichScenariosWithStoreData(scenarios, forbiddenAppIds = [], lan
             appId,
             name,
             mediaType: 'image',
-            media: `https://cdn.akamai.steamstatic.com/steam/apps/${appId}/library_600x900.jpg`,
-            mediaFallback: STEAM_HEADER_CDN(appId),
+            media: headerUrl,
+            mediaFallback: headerUrl,
+            headerImage: headerUrl,
             positiveRate,
             players: spyMeta && Number(spyMeta.ccu) > 0 ? `${Number(spyMeta.ccu).toLocaleString()} online` : '',
-            price: '',
+            price: spyMeta?.price ?? spyMeta?.initialprice ?? '',
             releaseDate: '',
             isNewRelease: false,
             reason: g.reason || (lang === 'zh-CN' ? '命运线与此作交汇，值得一试。' : 'A destiny link—worth a try.'),
@@ -2942,7 +2949,22 @@ async function enrichScenariosWithStoreData(scenarios, forbiddenAppIds = [], lan
     enriched[key] = {
       title: lane.title,
       description: lane.description,
-      games,
+      games: games.map((game) => {
+        const appId = Number(game.appId);
+        const name = (game.name && String(game.name).trim()) || (lang === 'zh-CN' ? '未知命运' : 'Unknown Game');
+        const headerUrl = game.headerImage || game.mediaFallback || game.media || STEAM_HEADER_CDN(appId);
+        return {
+          ...game,
+          appId,
+          name,
+          media: game.media || headerUrl,
+          mediaFallback: game.mediaFallback || headerUrl,
+          headerImage: game.headerImage || headerUrl,
+          price: game.price ?? '',
+          positiveRate: game.positiveRate ?? '',
+          players: game.players ?? '',
+        };
+      }),
     };
   }
 
