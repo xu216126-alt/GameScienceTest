@@ -1123,7 +1123,11 @@ function createGameCard(game, revealIndex) {
   card.className = "game-card";
   card.dataset.appId = String(game.appId);
   const name = game.name || game.title || "未知命运";
-  const isPlaceholder = name === `App ${game.appId}`;
+  const isPlaceholder =
+    name === `App ${game.appId}` ||
+    name === "Unknown Game" ||
+    name === "未知命运" ||
+    !(game.positiveRate && game.positiveRate !== "N/A");
   if (isPlaceholder) card.classList.add("game-card--placeholder");
 
   const mediaWrap = document.createElement("div");
