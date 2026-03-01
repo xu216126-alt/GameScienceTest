@@ -1,7 +1,4 @@
 "use strict";
-var __importDefault = (this && this.__importDefault) || function (mod) {
-    return (mod && mod.__esModule) ? mod : { "default": mod };
-};
 Object.defineProperty(exports, "__esModule", { value: true });
 exports.init = init;
 exports.getGamesMeta = getGamesMeta;
@@ -14,10 +11,10 @@ exports.getTopAppIdsForSync = getTopAppIdsForSync;
  * Steam Store 数据层：所有 Steam Store 请求由此统一管理
  * - 批量请求 appdetails（每批最多 30，自动分批）
  * - Redis 缓存 steam_store_meta:{appid}，TTL 24h
- * - p-limit 最大并发 3
+ * - p-limit 最大并发 3（使用 p-limit@3 以兼容 CommonJS/require）
  * - 支持 STEAM_STORE_BASE_URL 代理
  */
-const p_limit_1 = __importDefault(require("p-limit"));
+const pLimit = require('p-limit');
 const BATCH_SIZE = 30;
 const CONCURRENCY = 3;
 const CACHE_KEY_PREFIX = 'steam_store_meta:';
@@ -136,7 +133,7 @@ async function getGamesMeta(appIds, lang = 'en-US') {
         return [];
     }
     const redis = (getRedisHealthyFn && !getRedisHealthyFn()) ? null : (getRedisFn?.() ?? null);
-    const limit = (0, p_limit_1.default)(CONCURRENCY);
+    const limit = pLimit(CONCURRENCY);
     const result = [];
     const missIds = [];
     if (redis) {
@@ -245,7 +242,7 @@ async function syncStoreMetaToRedis(appIds, lang = 'en-US') {
         return { synced: 0, failed: 0, steamBatches: 0 };
     }
     const redis = getRedisFn?.() ?? null;
-    const limit = (0, p_limit_1.default)(CONCURRENCY);
+    const limit = pLimit(CONCURRENCY);
     const { results, steamBatches } = await fetchMissingFromSteam(unique, lang, limit);
     let synced = 0;
     let failed = unique.length - Object.keys(results).length;

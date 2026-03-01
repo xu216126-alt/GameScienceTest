@@ -13,7 +13,6 @@ let steamSpyCalls = 0;
 let cacheHits = 0;
 let cacheMisses = 0;
 let lastResetTs = Date.now();
-const ONE_DAY_MS = 24 * 60 * 60 * 1000;
 function isNewDay() {
     const now = Date.now();
     const lastDay = new Date(lastResetTs).toDateString();

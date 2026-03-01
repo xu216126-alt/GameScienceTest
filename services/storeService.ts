@@ -2,10 +2,10 @@
  * Steam Store 数据层：所有 Steam Store 请求由此统一管理
  * - 批量请求 appdetails（每批最多 30，自动分批）
  * - Redis 缓存 steam_store_meta:{appid}，TTL 24h
- * - p-limit 最大并发 3
+ * - p-limit 最大并发 3（使用 p-limit@3 以兼容 CommonJS/require）
  * - 支持 STEAM_STORE_BASE_URL 代理
  */
-import pLimit from 'p-limit';
+const pLimit = require('p-limit');
 
 const BATCH_SIZE = 30;
 const CONCURRENCY = 3;
