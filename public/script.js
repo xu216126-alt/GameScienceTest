@@ -1126,8 +1126,7 @@ function createGameCard(game, revealIndex) {
   const isPlaceholder =
     name === `App ${game.appId}` ||
     name === "Unknown Game" ||
-    name === "未知命运" ||
-    !(game.positiveRate && game.positiveRate !== "N/A");
+    name === "未知命运";
   if (isPlaceholder) card.classList.add("game-card--placeholder");
 
   const mediaWrap = document.createElement("div");
@@ -1375,6 +1374,7 @@ async function enrichPlaceholderCards() {
       if (!card) return;
       const appId = Number(id);
       const displayName = details.name || details.title || "未知命运";
+      const isPlaceholderName = !displayName || displayName === "Unknown Game" || displayName === "未知命运" || displayName === `App ${appId}`;
       const media = card.querySelector(".game-media");
       const title = card.querySelector(".card-info h4");
       const priceLine = card.querySelector(".card-price");
@@ -1389,7 +1389,7 @@ async function enrichPlaceholderCards() {
         media.src = imgUrl;
         media.alt = `${displayName} poster`;
       }
-      if (title) title.textContent = displayName;
+      if (title && !isPlaceholderName) title.textContent = displayName;
       if (priceLine) priceLine.textContent = `${t("priceLabel")}: ${details.price ?? t("naLabel")}`;
       if (metrics) {
         const values = card.querySelectorAll(".game-metrics .metric-value");
@@ -1397,7 +1397,7 @@ async function enrichPlaceholderCards() {
         if (values[1]) values[1].textContent = details.currentPlayers ?? t("naLabel");
         if (values[2]) values[2].textContent = details.price ?? t("naLabel");
       }
-      card.classList.remove("game-card--placeholder");
+      if (!isPlaceholderName) card.classList.remove("game-card--placeholder");
     });
   } catch (_) {}
 }
