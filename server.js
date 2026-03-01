@@ -2318,12 +2318,12 @@ async function getGamesMetaMapSteamSpyOnly(appIds) {
     const steamSpyMeta = await getSteamSpyMetaFromRedis(redis, unique);
     for (const id of unique) {
       const spy = steamSpyMeta.get(id);
-      if (spy) map.set(id, buildGameMetaFromSteamSpy(id, spy));
-      else map.set(id, storeService.normalizeGameData(id, null, null));
+      const meta = spy ? buildGameMetaFromSteamSpy(id, spy) : storeService.normalizeGameData(id, null, null);
+      map.set(id, storeService.formatGameResponse(meta, id));
     }
   } else {
     for (const id of unique) {
-      map.set(id, storeService.normalizeGameData(id, null, null));
+      map.set(id, storeService.formatGameResponse(null, id));
     }
   }
   return map;
@@ -2340,7 +2340,7 @@ async function getGamesMetaMapWithSteamSpyFirst(appIds, lang) {
     steamSpyMeta = await getSteamSpyMetaFromRedis(redis, unique);
     for (const id of unique) {
       const spy = steamSpyMeta.get(id);
-      if (spy) map.set(id, storeService.normalizeGameData(id, spy, null));
+      if (spy) map.set(id, storeService.formatGameResponse(storeService.normalizeGameData(id, spy, null), id));
     }
   }
   const missIds = unique.filter((id) => !map.has(id));
@@ -2348,12 +2348,12 @@ async function getGamesMetaMapWithSteamSpyFirst(appIds, lang) {
     const storeMap = await storeService.getGamesMetaMap(missIds, lang);
     storeMap.forEach((meta, id) => {
       if (meta && meta.name && !/^App\s+\d+$/i.test(meta.name)) {
-        map.set(id, storeService.normalizeGameData(id, steamSpyMeta.get(id) || null, meta));
+        map.set(id, storeService.formatGameResponse(storeService.normalizeGameData(id, steamSpyMeta.get(id) || null, meta), id));
       }
     });
     // Smart fallback: on 429 or partial failure, fill missing from Redis + static image so cards always show.
     for (const id of missIds) {
-      if (!map.has(id)) map.set(id, storeService.normalizeGameData(id, steamSpyMeta.get(id) || null, null));
+      if (!map.has(id)) map.set(id, storeService.formatGameResponse(storeService.normalizeGameData(id, steamSpyMeta.get(id) || null, null), id));
     }
   }
   return map;

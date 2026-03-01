@@ -87,6 +87,82 @@ function ensureInit(): void {
 export const STEAM_HEADER_CDN = (appId: number) =>
   `https://shared.fastly.steamstatic.com/store_item_assets/steam/apps/${appId}/header.jpg`;
 
+const DEFAULT_DESCRIPTION = 'Detailed description is temporarily unavailable for this game.';
+
+/**
+ * 翻译官：无论数据来自 Redis 还是 Steam API，都转换成统一格式。
+ * 保证输出始终包含 name, header_image, description, price；header_image 一律用 CDN 构造。
+ * 列表与模态框共用此格式，避免“列表空但弹窗有数据”的结构不一致。
+ */
+export function formatGameResponse(data: unknown, appId: number): GameMeta {
+  const id = Number(appId);
+  const headerImage = STEAM_HEADER_CDN(id);
+  const d = data as Record<string, unknown> | null | undefined;
+  if (!d || typeof d !== 'object') {
+    return {
+      appId: id,
+      appType: 'game',
+      name: 'Unknown Game',
+      posterImage: `https://cdn.akamai.steamstatic.com/steam/apps/${id}/library_600x900.jpg`,
+      headerImage,
+      shortDescription: DEFAULT_DESCRIPTION,
+      trailerUrl: '',
+      trailerPoster: '',
+      genres: [],
+      releaseDate: 'Unknown',
+      isFree: false,
+      price: 'N/A',
+      positiveRate: 'N/A',
+      currentPlayers: 'N/A',
+      steamUrl: `https://store.steampowered.com/app/${id}`,
+    };
+  }
+  const gm = d as unknown as Partial<GameMeta>;
+  const isGameMeta = typeof gm.appId === 'number' && typeof gm.name === 'string';
+  const name =
+    (isGameMeta && gm.name)
+      ? gm.name
+      : typeof d.name === 'string' && !/^App\s+\d+$/i.test(d.name)
+        ? String(d.name).trim()
+        : 'Unknown Game';
+  const description =
+    (isGameMeta && gm.shortDescription)
+      ? gm.shortDescription
+      : typeof (d as { short_description?: string }).short_description === 'string'
+        ? (d as { short_description: string }).short_description
+        : DEFAULT_DESCRIPTION;
+  let price: string;
+  if (isGameMeta && gm.price != null) {
+    price = String(gm.price);
+  } else if (typeof d.price === 'string' && d.price !== '') {
+    price = d.price;
+  } else if (typeof (d as { initialprice?: string }).initialprice === 'string') {
+    price = (d as { initialprice: string }).initialprice;
+  } else if ((d as { is_free?: boolean }).is_free) {
+    price = 'Free';
+  } else {
+    const po = (d as { price_overview?: { final_formatted?: string } }).price_overview;
+    price = po?.final_formatted ?? 'N/A';
+  }
+  return {
+    appId: id,
+    appType: gm.appType ?? String((d as { type?: string }).type ?? 'game'),
+    name,
+    posterImage: gm.posterImage ?? `https://cdn.akamai.steamstatic.com/steam/apps/${id}/library_600x900.jpg`,
+    headerImage,
+    shortDescription: description,
+    trailerUrl: gm.trailerUrl ?? '',
+    trailerPoster: gm.trailerPoster ?? '',
+    genres: Array.isArray(gm.genres) ? gm.genres : (Array.isArray((d as { genres?: { description?: string }[] }).genres) ? (d as { genres: { description?: string }[] }).genres.map((g) => String(g?.description ?? '')).filter(Boolean) : []),
+    releaseDate: gm.releaseDate ?? (d as { release_date?: { date?: string } }).release_date?.date ?? 'Unknown',
+    isFree: Boolean(gm.isFree ?? (d as { is_free?: boolean }).is_free ?? (price === 'Free' || price === '0')),
+    price,
+    positiveRate: gm.positiveRate ?? 'N/A',
+    currentPlayers: gm.currentPlayers ?? 'N/A',
+    steamUrl: gm.steamUrl ?? `https://store.steampowered.com/app/${id}`,
+  };
+}
+
 /** SteamSpy/redis steam_meta shape (partial). */
 export interface SteamSpyMeta {
   name?: string;
@@ -219,14 +295,14 @@ async function fetchAppDetailsBatch(appIds: number[], lang: string): Promise<Rec
   }
   if (!data || typeof data !== 'object') return {};
   const out: Record<number, GameMeta> = {};
-  for (const id of appIds) {
+    for (const id of appIds) {
     const node = data[String(id)];
     if (node?.success && node.data) {
       const meta = buildGameMeta(id, node.data);
       const isGame = meta.appType.toLowerCase() === 'game';
       const validName = meta.name && !/^App\s+\d+$/i.test(meta.name);
       const validMedia = Boolean(meta.headerImage);
-      if (isGame && validName && validMedia) out[id] = meta;
+      if (isGame && validName && validMedia) out[id] = formatGameResponse(meta, id);
     }
   }
   return out;
@@ -298,11 +374,12 @@ export async function getGamesMeta(appIds: number[], lang: string = 'en-US'): Pr
         : await Promise.all(keys.map((k) => redis.get(k)));
     for (let i = 0; i < unique.length; i++) {
       const raw = rawList[i];
+      const appId = unique[i];
       if (raw) {
         try {
           const parsed = JSON.parse(raw) as GameMeta;
           if (parsed?.appId && parsed?.name) {
-            result.push(parsed);
+            result.push(formatGameResponse(parsed, appId));
             onCacheHit?.();
             continue;
           }
@@ -311,7 +388,7 @@ export async function getGamesMeta(appIds: number[], lang: string = 'en-US'): Pr
         }
       }
       onCacheMiss?.();
-      missIds.push(unique[i]);
+      missIds.push(appId);
     }
   } else {
     for (const _ of unique) onCacheMiss?.();
@@ -325,10 +402,11 @@ export async function getGamesMeta(appIds: number[], lang: string = 'en-US'): Pr
     const { results: fromSteam, steamBatches: n } = await fetchMissingFromSteam(missIds, lang, limit);
     steamBatches = n;
     for (const meta of Object.values(fromSteam)) {
-      result.push(meta);
+      const formatted = formatGameResponse(meta, meta.appId);
+      result.push(formatted);
       if (redis) {
         try {
-          await redis.set(`${CACHE_KEY_PREFIX}${meta.appId}`, JSON.stringify(meta), { EX: CACHE_TTL_SEC });
+          await redis.set(`${CACHE_KEY_PREFIX}${formatted.appId}`, JSON.stringify(formatted), { EX: CACHE_TTL_SEC });
         } catch {
           // ignore
         }
@@ -377,7 +455,7 @@ export async function getGamesMetaMapCacheOnly(appIds: number[], _lang: string =
       try {
         const parsed = JSON.parse(raw) as GameMeta;
         if (parsed?.appId && parsed?.name) {
-          result.set(appId, parsed);
+          result.set(appId, formatGameResponse(parsed, appId));
           cacheHits += 1;
           onCacheHit?.();
           continue;

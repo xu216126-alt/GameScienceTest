@@ -1056,6 +1056,11 @@ function steamLinkForApp(appId) {
   return `https://store.steampowered.com/app/${appId}`;
 }
 
+/** 与后端一致：列表/弹窗无图时兜底头图，避免列表空而弹窗有数据 */
+function steamHeaderCdn(appId) {
+  return `https://shared.fastly.steamstatic.com/store_item_assets/steam/apps/${appId}/header.jpg`;
+}
+
 function compatibilityMeta(level) {
   if (level === "smooth") return { label: t("compatSmooth"), className: "compat-green" };
   if (level === "unplayable") return { label: t("compatUnplayable"), className: "compat-red" };
@@ -1117,7 +1122,8 @@ function createGameCard(game, revealIndex) {
   const card = document.createElement("article");
   card.className = "game-card";
   card.dataset.appId = String(game.appId);
-  const isPlaceholder = game.name === `App ${game.appId}`;
+  const name = game.name || game.title || "未知命运";
+  const isPlaceholder = name === `App ${game.appId}`;
   if (isPlaceholder) card.classList.add("game-card--placeholder");
 
   const mediaWrap = document.createElement("div");
@@ -1125,17 +1131,22 @@ function createGameCard(game, revealIndex) {
 
   const image = document.createElement("img");
   image.className = "game-media";
-  image.src = game.media || "";
-  if (game.mediaFallback) {
-    image.dataset.fallback = game.mediaFallback;
-  }
+  const imageSrc =
+    game.media ||
+    game.mediaFallback ||
+    game.headerImage ||
+    game.header_image ||
+    (game.appId ? steamHeaderCdn(game.appId) : "");
+  image.src = imageSrc;
+  const fallbackUrl = game.mediaFallback || game.headerImage || game.header_image || (game.appId ? steamHeaderCdn(game.appId) : "");
+  if (fallbackUrl) image.dataset.fallback = fallbackUrl;
   image.addEventListener("error", () => {
     const fallback = image.dataset.fallback;
     if (fallback && image.src !== fallback) {
       image.src = fallback;
     }
   });
-  image.alt = `${game.name} poster`;
+  image.alt = `${name} poster`;
   mediaWrap.appendChild(image);
   if (game.isNewRelease) {
     const newBadge = document.createElement("span");
@@ -1156,7 +1167,7 @@ function createGameCard(game, revealIndex) {
   info.className = "card-info";
 
   const title = document.createElement("h4");
-  title.textContent = game.name;
+  title.textContent = name;
   info.appendChild(title);
 
   const compat = compatibilityMeta(game.compatibility || "playable");
@@ -1228,7 +1239,7 @@ function createGameCard(game, revealIndex) {
   detailsBtn.textContent = t("viewDetails");
   detailsBtn.addEventListener("click", () => {
     const nameEl = card.querySelector(".card-info h4");
-    openGameModal(game.appId, nameEl ? nameEl.textContent : game.name, game.reason, game.destinyLink);
+    openGameModal(game.appId, nameEl ? nameEl.textContent : name, game.reason, game.destinyLink);
   });
 
   const steamLink = document.createElement("a");
@@ -1357,22 +1368,30 @@ async function enrichPlaceholderCards() {
     if (!data || typeof data !== "object") return;
     Object.entries(data).forEach(([id, details]) => {
       const card = document.querySelector(`.game-card[data-app-id="${id}"]`);
-      if (!card || !details.name) return;
+      if (!card) return;
+      const appId = Number(id);
+      const displayName = details.name || details.title || "未知命运";
       const media = card.querySelector(".game-media");
       const title = card.querySelector(".card-info h4");
       const priceLine = card.querySelector(".card-price");
       const metrics = card.querySelector(".game-metrics");
       if (media) {
-        media.src = details.posterImage || details.headerImage || media.src;
-        media.alt = `${details.name} poster`;
+        const imgUrl =
+          details.posterImage ||
+          details.headerImage ||
+          details.header_image ||
+          (appId ? steamHeaderCdn(appId) : "") ||
+          media.src;
+        media.src = imgUrl;
+        media.alt = `${displayName} poster`;
       }
-      if (title) title.textContent = details.name;
-      if (priceLine) priceLine.textContent = `${t("priceLabel")}: ${details.price || t("naLabel")}`;
+      if (title) title.textContent = displayName;
+      if (priceLine) priceLine.textContent = `${t("priceLabel")}: ${details.price ?? t("naLabel")}`;
       if (metrics) {
         const values = card.querySelectorAll(".game-metrics .metric-value");
-        if (values[0]) values[0].textContent = details.positiveRate || t("naLabel");
-        if (values[1]) values[1].textContent = details.currentPlayers || t("naLabel");
-        if (values[2]) values[2].textContent = details.price || t("naLabel");
+        if (values[0]) values[0].textContent = details.positiveRate ?? t("naLabel");
+        if (values[1]) values[1].textContent = details.currentPlayers ?? t("naLabel");
+        if (values[2]) values[2].textContent = details.price ?? t("naLabel");
       }
       card.classList.remove("game-card--placeholder");
     });
@@ -1437,12 +1456,17 @@ async function openGameModal(appId, fallbackName, recommendationReason, destinyL
     const data = await response.json();
     if (!response.ok) throw new Error(data.error || t("gameDetailsError"));
 
-    modalTitle.textContent = data.name;
+    const modalName = data.name || data.title || "未知命运";
+    modalTitle.textContent = modalName;
+    const headerImg =
+      data.headerImage ||
+      data.header_image ||
+      (data.appId ? steamHeaderCdn(data.appId) : "");
     const mediaHtml = data.trailerUrl
-      ? `<video class="modal-image" controls preload="none" poster="${data.trailerPoster || data.headerImage || ""}">
+      ? `<video class="modal-image" controls preload="none" poster="${data.trailerPoster || headerImg || ""}">
            <source src="${data.trailerUrl}" type="video/mp4" />
          </video>`
-      : `<img class="modal-image" src="${data.headerImage}" alt="${data.name} header" />`;
+      : `<img class="modal-image" src="${headerImg}" alt="${escapeHtml(modalName)} header" />`;
     const reasonBlock =
       recommendationReason && recommendationReason.trim()
         ? `<section class="modal-reason"><h4 class="modal-reason-title">推荐理由</h4><p class="modal-reason-text">${escapeHtml(recommendationReason)}</p></section>`
