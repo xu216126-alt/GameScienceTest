@@ -1,7 +1,8 @@
 "use strict";
 Object.defineProperty(exports, "__esModule", { value: true });
-exports.STEAM_HEADER_CDN = void 0;
+exports.DEFAULT_DESCRIPTION = exports.STEAM_HEADER_CDN = void 0;
 exports.init = init;
+exports.needsSteamStoreEnrichment = needsSteamStoreEnrichment;
 exports.formatGameResponse = formatGameResponse;
 exports.normalizeGameData = normalizeGameData;
 exports.getGamesMeta = getGamesMeta;
@@ -51,10 +52,19 @@ function ensureInit() {
         throw new Error('storeService not initialized: call storeService.init(config) first');
     }
 }
-/** Static image URL for every game; do not wait for Steam Store API. */
+/** 头图 URL 仅根据 appid 拼接，不经过任何网络请求；API 429 或空时列表也不缺图。 */
 const STEAM_HEADER_CDN = (appId) => `https://shared.fastly.steamstatic.com/store_item_assets/steam/apps/${appId}/header.jpg`;
 exports.STEAM_HEADER_CDN = STEAM_HEADER_CDN;
-const DEFAULT_DESCRIPTION = 'Detailed description is temporarily unavailable for this game.';
+/** 缺省描述占位符；SteamSpy 数据无 description，归一化后会得到此值，需向 Steam Store 补全。 */
+exports.DEFAULT_DESCRIPTION = 'Detailed description is temporarily unavailable for this game.';
+/**
+ * 数据完整性检查：若仅有 SteamSpy（steam_meta）数据，通常无 description，应标记为需补全并请求 Steam Store。
+ * 用于避免“缓存命中”陷阱：Redis 命中后不再请求 Steam 导致列表只有英文名、无描述。
+ */
+function needsSteamStoreEnrichment(meta) {
+    const desc = (meta?.shortDescription ?? '').trim();
+    return !desc || desc === exports.DEFAULT_DESCRIPTION;
+}
 /**
  * 翻译官：无论数据来自 Redis 还是 Steam API，都转换成统一格式。
  * 保证输出始终包含 name, header_image, description, price；header_image 一律用 CDN 构造。
@@ -62,6 +72,7 @@ const DEFAULT_DESCRIPTION = 'Detailed description is temporarily unavailable for
  */
 function formatGameResponse(data, appId) {
     const id = Number(appId);
+    // 彻底不依赖 API：头图仅根据 appid 写死拼接，API 未返回或 429 时也不缺图
     const headerImage = (0, exports.STEAM_HEADER_CDN)(id);
     const d = data;
     if (!d || typeof d !== 'object') {
@@ -71,7 +82,7 @@ function formatGameResponse(data, appId) {
             name: 'Unknown Game',
             posterImage: `https://cdn.akamai.steamstatic.com/steam/apps/${id}/library_600x900.jpg`,
             headerImage,
-            shortDescription: DEFAULT_DESCRIPTION,
+            shortDescription: exports.DEFAULT_DESCRIPTION,
             trailerUrl: '',
             trailerPoster: '',
             genres: [],
@@ -94,7 +105,7 @@ function formatGameResponse(data, appId) {
         ? gm.shortDescription
         : typeof d.short_description === 'string'
             ? d.short_description
-            : DEFAULT_DESCRIPTION;
+            : exports.DEFAULT_DESCRIPTION;
     let price;
     if (isGameMeta && gm.price != null) {
         price = String(gm.price);
@@ -117,7 +128,7 @@ function formatGameResponse(data, appId) {
         appType: gm.appType ?? String(d.type ?? 'game'),
         name,
         posterImage: gm.posterImage ?? `https://cdn.akamai.steamstatic.com/steam/apps/${id}/library_600x900.jpg`,
-        headerImage,
+        headerImage, // 始终为上面根据 id 拼接的值，从不使用 API/传入数据的 header 字段
         shortDescription: description,
         trailerUrl: gm.trailerUrl ?? '',
         trailerPoster: gm.trailerPoster ?? '',
@@ -177,7 +188,7 @@ function normalizeGameData(appId, redisData, steamApiData) {
         appType: steamMeta?.appType ?? (steamRaw ? String(steamRaw.type || '') : 'game'),
         name,
         posterImage: steamMeta?.posterImage ?? `https://cdn.akamai.steamstatic.com/steam/apps/${id}/library_600x900.jpg`,
-        headerImage: (0, exports.STEAM_HEADER_CDN)(id),
+        headerImage: (0, exports.STEAM_HEADER_CDN)(id), // 仅根据 appid 拼接，不读 redis/API，429 时也不缺图
         shortDescription: (steamMeta?.shortDescription ?? ((steamRaw ? String(steamRaw.short_description ?? '') : '') || 'Detailed description is temporarily unavailable for this game.')),
         trailerUrl: steamMeta?.trailerUrl ?? '',
         trailerPoster: steamMeta?.trailerPoster ?? '',
@@ -197,7 +208,7 @@ function buildGameMeta(appId, data) {
         appType: String(data.type || ''),
         name: data.name || `App ${id}`,
         posterImage: `https://cdn.akamai.steamstatic.com/steam/apps/${id}/library_600x900.jpg`,
-        headerImage: (0, exports.STEAM_HEADER_CDN)(id),
+        headerImage: (0, exports.STEAM_HEADER_CDN)(id), // 仅按 appid 拼接，不依赖 API 返回的 header 字段
         shortDescription: data.short_description || 'Detailed description is temporarily unavailable for this game.',
         trailerUrl: (() => {
             const m = data.movies?.[0];
@@ -301,9 +312,10 @@ async function getGamesMeta(appIds, lang = 'en-US') {
         const rawList = typeof redisAny.mget === 'function'
             ? await redisAny.mget(...keys)
             : await Promise.all(keys.map((k) => redis.get(k)));
+        // 严格按索引：rawList[i] 对应 unique[i]，避免某 key 为 null 时后续整体错位
         for (let i = 0; i < unique.length; i++) {
-            const raw = rawList[i];
             const appId = unique[i];
+            const raw = rawList[i] ?? null;
             if (raw) {
                 try {
                     const parsed = JSON.parse(raw);
@@ -373,9 +385,10 @@ async function getGamesMetaMapCacheOnly(appIds, _lang = 'en-US') {
     const rawList = typeof redisAny.mget === 'function'
         ? await redisAny.mget(...keys)
         : await Promise.all(keys.map((k) => redis.get(k)));
+    // 严格按索引：rawList[i] 对应 unique[i]，避免 null 导致张冠李戴
     for (let i = 0; i < unique.length; i++) {
         const appId = unique[i];
-        const raw = rawList[i];
+        const raw = rawList[i] ?? null;
         if (raw) {
             try {
                 const parsed = JSON.parse(raw);

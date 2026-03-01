@@ -83,11 +83,21 @@ function ensureInit(): void {
   }
 }
 
-/** Static image URL for every game; do not wait for Steam Store API. */
+/** 头图 URL 仅根据 appid 拼接，不经过任何网络请求；API 429 或空时列表也不缺图。 */
 export const STEAM_HEADER_CDN = (appId: number) =>
   `https://shared.fastly.steamstatic.com/store_item_assets/steam/apps/${appId}/header.jpg`;
 
-const DEFAULT_DESCRIPTION = 'Detailed description is temporarily unavailable for this game.';
+/** 缺省描述占位符；SteamSpy 数据无 description，归一化后会得到此值，需向 Steam Store 补全。 */
+export const DEFAULT_DESCRIPTION = 'Detailed description is temporarily unavailable for this game.';
+
+/**
+ * 数据完整性检查：若仅有 SteamSpy（steam_meta）数据，通常无 description，应标记为需补全并请求 Steam Store。
+ * 用于避免“缓存命中”陷阱：Redis 命中后不再请求 Steam 导致列表只有英文名、无描述。
+ */
+export function needsSteamStoreEnrichment(meta: GameMeta): boolean {
+  const desc = (meta?.shortDescription ?? '').trim();
+  return !desc || desc === DEFAULT_DESCRIPTION;
+}
 
 /**
  * 翻译官：无论数据来自 Redis 还是 Steam API，都转换成统一格式。
@@ -96,6 +106,7 @@ const DEFAULT_DESCRIPTION = 'Detailed description is temporarily unavailable for
  */
 export function formatGameResponse(data: unknown, appId: number): GameMeta {
   const id = Number(appId);
+  // 彻底不依赖 API：头图仅根据 appid 写死拼接，API 未返回或 429 时也不缺图
   const headerImage = STEAM_HEADER_CDN(id);
   const d = data as Record<string, unknown> | null | undefined;
   if (!d || typeof d !== 'object') {
@@ -149,7 +160,7 @@ export function formatGameResponse(data: unknown, appId: number): GameMeta {
     appType: gm.appType ?? String((d as { type?: string }).type ?? 'game'),
     name,
     posterImage: gm.posterImage ?? `https://cdn.akamai.steamstatic.com/steam/apps/${id}/library_600x900.jpg`,
-    headerImage,
+    headerImage, // 始终为上面根据 id 拼接的值，从不使用 API/传入数据的 header 字段
     shortDescription: description,
     trailerUrl: gm.trailerUrl ?? '',
     trailerPoster: gm.trailerPoster ?? '',
@@ -236,7 +247,7 @@ export function normalizeGameData(
     appType: steamMeta?.appType ?? (steamRaw ? String((steamRaw as { type?: string }).type || '') : 'game'),
     name,
     posterImage: steamMeta?.posterImage ?? `https://cdn.akamai.steamstatic.com/steam/apps/${id}/library_600x900.jpg`,
-    headerImage: STEAM_HEADER_CDN(id),
+    headerImage: STEAM_HEADER_CDN(id), // 仅根据 appid 拼接，不读 redis/API，429 时也不缺图
     shortDescription: (steamMeta?.shortDescription ?? ((steamRaw ? String((steamRaw as { short_description?: string }).short_description ?? '') : '') || 'Detailed description is temporarily unavailable for this game.')),
     trailerUrl: steamMeta?.trailerUrl ?? '',
     trailerPoster: steamMeta?.trailerPoster ?? '',
@@ -257,7 +268,7 @@ function buildGameMeta(appId: number, data: Record<string, unknown>): GameMeta {
     appType: String(data.type || ''),
     name: (data.name as string) || `App ${id}`,
     posterImage: `https://cdn.akamai.steamstatic.com/steam/apps/${id}/library_600x900.jpg`,
-    headerImage: STEAM_HEADER_CDN(id),
+    headerImage: STEAM_HEADER_CDN(id), // 仅按 appid 拼接，不依赖 API 返回的 header 字段
     shortDescription: (data.short_description as string) || 'Detailed description is temporarily unavailable for this game.',
     trailerUrl: (() => {
       const m = (data.movies as { mp4?: { max?: string; '480'?: string }; thumbnail?: string }[])?.[0];
@@ -372,9 +383,10 @@ export async function getGamesMeta(appIds: number[], lang: string = 'en-US'): Pr
       typeof redisAny.mget === 'function'
         ? await redisAny.mget(...keys)
         : await Promise.all(keys.map((k) => redis.get(k)));
+    // 严格按索引：rawList[i] 对应 unique[i]，避免某 key 为 null 时后续整体错位
     for (let i = 0; i < unique.length; i++) {
-      const raw = rawList[i];
       const appId = unique[i];
+      const raw = rawList[i] ?? null;
       if (raw) {
         try {
           const parsed = JSON.parse(raw) as GameMeta;
@@ -448,9 +460,10 @@ export async function getGamesMetaMapCacheOnly(appIds: number[], _lang: string =
     typeof redisAny.mget === 'function'
       ? await redisAny.mget(...keys)
       : await Promise.all(keys.map((k) => redis.get(k)));
+  // 严格按索引：rawList[i] 对应 unique[i]，避免 null 导致张冠李戴
   for (let i = 0; i < unique.length; i++) {
     const appId = unique[i];
-    const raw = rawList[i];
+    const raw = rawList[i] ?? null;
     if (raw) {
       try {
         const parsed = JSON.parse(raw) as GameMeta;

@@ -1688,7 +1688,7 @@ async function getGameDetails(appId, lang = 'en-US') {
     appType: String(data.type || ''),
     name: data.name || `App ${appId}`,
     posterImage: `https://cdn.akamai.steamstatic.com/steam/apps/${appId}/library_600x900.jpg`,
-    headerImage: data.header_image || `https://shared.fastly.steamstatic.com/store_item_assets/steam/apps/${appId}/header.jpg`,
+    headerImage: `https://shared.fastly.steamstatic.com/store_item_assets/steam/apps/${appId}/header.jpg`, // 仅按 appid 拼接，不依赖 API 返回
     shortDescription: data.short_description || 'Detailed description is temporarily unavailable for this game.',
     trailerUrl: data.movies?.[0]?.mp4?.max || data.movies?.[0]?.mp4?.["480"] || '',
     trailerPoster: data.movies?.[0]?.thumbnail || '',
@@ -2279,7 +2279,7 @@ function buildBacklogFromOwned(profile, forbiddenSet, lang = 'en-US') {
 
 const STEAM_META_KEY_PREFIX = 'steam_meta:';
 
-/** 仅从 Redis 读取 steam_meta:{appid}，不调用 Steam API。批量用 mget 一次取回，无 mget 时退化为 Promise.all(get)。 */
+/** 仅从 Redis 读取 steam_meta:{appid}，不调用 Steam API。批量用 mget 一次取回；严格按索引 results[i] 对应 unique[i]，避免 null 导致错位。 */
 async function getSteamSpyMetaFromRedis(redis, appIds) {
   if (!redis || !appIds || appIds.length === 0) return new Map();
   const unique = [...new Set(appIds.map((id) => Number(id)).filter((id) => Number.isInteger(id) && id > 0))];
@@ -2290,11 +2290,12 @@ async function getSteamSpyMetaFromRedis(redis, appIds) {
       : await Promise.all(keys.map((k) => redis.get(k)));
   const map = new Map();
   for (let i = 0; i < unique.length; i++) {
-    const raw = results[i];
+    const appId = unique[i];
+    const raw = results[i] ?? null; // 严格按索引：results[i] 对应 keys[i]/unique[i]，null 不导致后续错位
     if (raw == null) continue;
     try {
       const meta = typeof raw === 'string' ? JSON.parse(raw) : raw;
-      if (meta && Number.isInteger(Number(meta.appid))) map.set(unique[i], meta);
+      if (meta && Number.isInteger(Number(meta.appid))) map.set(appId, meta);
     } catch (_) {}
   }
   return map;
@@ -2329,30 +2330,39 @@ async function getGamesMetaMapSteamSpyOnly(appIds) {
   return map;
 }
 
-/** 先查 steam_meta:{appid}（单次 mget），仅对缺失的请求 Steam；429 时不抛错，用 Redis + 静态头图补全，保证卡片不空。 */
+/** 先查 steam_meta:{appid}（单次 mget）。缺失的或“仅 SteamSpy、缺 description”的均请求 Steam 补全；429 时用 Redis + 静态头图兜底。 */
 async function getGamesMetaMapWithSteamSpyFirst(appIds, lang) {
   const unique = [...new Set((appIds || []).map((id) => Number(id)).filter((id) => Number.isInteger(id) && id > 0))];
   if (unique.length === 0) return new Map();
   const map = new Map();
   const redis = redisClient && redisHealthy ? redisClient : null;
   let steamSpyMeta = new Map();
+  const idsNeedingEnrichment = []; // 有 steam_meta 但缺 description，需请求 Steam Store 补全
   if (redis) {
     steamSpyMeta = await getSteamSpyMetaFromRedis(redis, unique);
     for (const id of unique) {
       const spy = steamSpyMeta.get(id);
-      if (spy) map.set(id, storeService.formatGameResponse(storeService.normalizeGameData(id, spy, null), id));
+      if (spy) {
+        const meta = storeService.formatGameResponse(storeService.normalizeGameData(id, spy, null), id);
+        if (!storeService.needsSteamStoreEnrichment(meta)) {
+          map.set(id, meta);
+        } else {
+          idsNeedingEnrichment.push(id);
+        }
+      }
     }
   }
-  const missIds = unique.filter((id) => !map.has(id));
-  if (missIds.length > 0) {
-    const storeMap = await storeService.getGamesMetaMap(missIds, lang);
+  const missIds = unique.filter((id) => !map.has(id)); // 无 steam_meta 的 ID
+  const idsToFetch = [...new Set([...missIds, ...idsNeedingEnrichment])];
+  if (idsToFetch.length > 0) {
+    const storeMap = await storeService.getGamesMetaMap(idsToFetch, lang);
     storeMap.forEach((meta, id) => {
       if (meta && meta.name && !/^App\s+\d+$/i.test(meta.name)) {
         map.set(id, storeService.formatGameResponse(storeService.normalizeGameData(id, steamSpyMeta.get(id) || null, meta), id));
       }
     });
     // Smart fallback: on 429 or partial failure, fill missing from Redis + static image so cards always show.
-    for (const id of missIds) {
+    for (const id of idsToFetch) {
       if (!map.has(id)) map.set(id, storeService.formatGameResponse(storeService.normalizeGameData(id, steamSpyMeta.get(id) || null, null), id));
     }
   }
@@ -2857,8 +2867,8 @@ async function enrichScenariosWithStoreData(scenarios, forbiddenAppIds = [], lan
     const releaseDate = details.releaseDate || '';
     const newRelease = isNewRelease(releaseDate);
     const reason = useNewReleaseReason && newRelease ? buildNewReleaseReason(lang) : (g.reason || '');
-    const headerUrl = details.headerImage || details.header_image || STEAM_HEADER_CDN(appId);
-    const mediaUrl = details.posterImage || details.headerImage || details.header_image || headerUrl;
+    const headerUrl = STEAM_HEADER_CDN(appId); // 仅按 appid 拼接，不依赖 API，避免 429 时缺图
+    const mediaUrl = details.posterImage || headerUrl;
     const name = (details.name && !/^App\s+\d+$/i.test(String(details.name)))
       ? String(details.name).trim()
       : (lang === 'zh-CN' ? '未知命运' : 'Unknown Game');
@@ -2952,14 +2962,14 @@ async function enrichScenariosWithStoreData(scenarios, forbiddenAppIds = [], lan
       games: games.map((game) => {
         const appId = Number(game.appId);
         const name = (game.name && String(game.name).trim()) || (lang === 'zh-CN' ? '未知命运' : 'Unknown Game');
-        const headerUrl = game.headerImage || game.mediaFallback || game.media || STEAM_HEADER_CDN(appId);
+        const headerUrl = STEAM_HEADER_CDN(appId); // 仅按 appid 拼接，不依赖上游字段
         return {
           ...game,
           appId,
           name,
           media: game.media || headerUrl,
-          mediaFallback: game.mediaFallback || headerUrl,
-          headerImage: game.headerImage || headerUrl,
+          mediaFallback: headerUrl,
+          headerImage: headerUrl,
           price: game.price ?? '',
           positiveRate: game.positiveRate ?? '',
           players: game.players ?? '',
@@ -3454,11 +3464,12 @@ const server = http.createServer(async (req, res) => {
         description: (aiOutput.scenarios?.backlogReviver?.description || (lang === 'zh-CN' ? '翻翻自己的库存里被冷落的宝藏。' : 'Rediscover underplayed games from your own library.')),
         games: aiBacklog.length ? aiBacklog : buildBacklogFromOwned(profile, forbiddenForBacklog, lang),
       };
+      // 在后端完成所有数据合并后再返回，不依赖前端二次请求补全，避免 10s 超时/竞态导致卡片空白
       const enrichedScenarios = await enrichScenariosWithStoreData(
         repairedNonOwned,
         [...recentRecommendedAppIds, ...mergedExcludedSessionAppIds],
         lang,
-        { alternatePool: [...TRENDING_FALLBACK_POOL], cacheOnly: usedFallback, preflight: true }
+        { alternatePool: [...TRENDING_FALLBACK_POOL], cacheOnly: usedFallback, preflight: false }
       );
       if (usedFallback) {
         console.log('[ai-analysis] fallback 阶段是否触发 Steam 请求: 否 (steamBatches=0，仅读本地缓存)');
@@ -3658,12 +3669,13 @@ const server = http.createServer(async (req, res) => {
         if (!details || !details.name || /^App\s+\d+$/i.test(details.name)) {
           throw new Error('Daily fortune game details unavailable');
         }
+        const headerUrl = STEAM_HEADER_CDN(details.appId);
         const game = {
           appId: details.appId,
           name: details.name,
           mediaType: 'image',
-          media: details.posterImage || details.headerImage,
-          mediaFallback: details.headerImage,
+          media: details.posterImage || headerUrl,
+          mediaFallback: headerUrl,
           positiveRate: details.positiveRate,
           players: details.currentPlayers,
           price: details.price,
