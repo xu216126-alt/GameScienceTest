@@ -302,6 +302,10 @@ const SESSION_BLACKLIST_KEY_PREFIX = 'steam_sense:session_blacklist:';
 // Daily Fortune (塔罗式每日运势): 按自然日（UTC）区分，同用户同日同牌同本命游戏，跨日即更新
 const DAILY_FORTUNE_KEY_PREFIX = 'steam_sense:daily_fortune:';
 const DAILY_FORTUNE_TTL_SEC = 86400; // 24 hours
+const DAILY_FORTUNE_GAME_HISTORY_KEY_PREFIX = 'steam_sense:daily_fortune_game_history:';
+const DAILY_FORTUNE_GAME_HISTORY_MAX = 14; // 最近 N 次本命游戏参与防重复
+const DAILY_FORTUNE_GAME_HISTORY_TTL_SEC = 30 * 86400; // 30 天
+const DAILY_FORTUNE_GAME_HISTORY_FALLBACK = new Map(); // 无 Redis 时内存兜底
 
 /** 当日日期串（UTC），用于塔罗缓存键与抽牌/候选种子，保证每日更新 */
 function getDailyFortuneDateString() {
@@ -1083,6 +1087,40 @@ async function setDailyFortuneCache(steamId, data) {
   DAILY_FORTUNE_FALLBACK_CACHE.set(memoryKey, { timestamp: Date.now(), data });
 }
 
+/** 读取用户最近作为本命游戏推荐过的 appId 列表，用于防重复（仅本命游戏，抽牌不做限制）。 */
+async function getDailyFortuneGameHistory(steamId) {
+  if (!steamId) return [];
+  const key = `${DAILY_FORTUNE_GAME_HISTORY_KEY_PREFIX}${steamId}`;
+  if (redisClient && redisHealthy) {
+    try {
+      const raw = await redisClient.get(key);
+      const arr = parseRedisJson(raw);
+      return Array.isArray(arr) ? arr.map((id) => Number(id)).filter((id) => Number.isInteger(id) && id > 0) : [];
+    } catch (err) {
+      console.warn('Redis getDailyFortuneGameHistory failed:', err?.message);
+    }
+  }
+  const mem = DAILY_FORTUNE_GAME_HISTORY_FALLBACK.get(steamId);
+  return Array.isArray(mem) ? [...mem] : [];
+}
+
+/** 将本次本命游戏 appId 追加到用户历史，并截断为最近 N 次。 */
+async function appendDailyFortuneGameHistory(steamId, appId) {
+  if (!steamId || !Number.isInteger(Number(appId))) return;
+  const id = Number(appId);
+  const key = `${DAILY_FORTUNE_GAME_HISTORY_KEY_PREFIX}${steamId}`;
+  const prev = await getDailyFortuneGameHistory(steamId);
+  const next = [...prev.filter((x) => x !== id), id].slice(-DAILY_FORTUNE_GAME_HISTORY_MAX);
+  if (redisClient && redisHealthy) {
+    try {
+      await redisClient.set(key, JSON.stringify(next), { EX: DAILY_FORTUNE_GAME_HISTORY_TTL_SEC });
+    } catch (err) {
+      console.warn('Redis appendDailyFortuneGameHistory failed:', err?.message);
+    }
+  }
+  DAILY_FORTUNE_GAME_HISTORY_FALLBACK.set(steamId, next);
+}
+
 /** Deterministic card index for steamId + today (UTC date). Same user same day = same card; different user or day = different card. */
 function pickCardForUser(steamId) {
   const dateStr = getDailyFortuneDateString();
@@ -1122,7 +1160,14 @@ async function getCandidateGamesForFortune(steamId, lang = 'zh-CN') {
       candidates.push({ appId: details.appId, name: details.name });
     }
   }
-  return candidates.length > 0 ? candidates : [{ appId: 1145360, name: 'Hades' }];
+  let list = candidates.length > 0 ? candidates : [{ appId: 1145360, name: 'Hades' }];
+  const recentGameIds = await getDailyFortuneGameHistory(steamId);
+  if (recentGameIds.length > 0) {
+    const excludeSet = new Set(recentGameIds);
+    const filtered = list.filter((c) => !excludeSet.has(Number(c.appId)));
+    if (filtered.length > 0) list = filtered;
+  }
+  return list;
 }
 
 async function callAiForDailyFortune(cardName, activityDiff, candidates, lang = 'zh-CN') {
@@ -3684,6 +3729,7 @@ const server = http.createServer(async (req, res) => {
         };
         const payload = { card: { cardId: card.cardId, cardName: card.cardName, cardImageUrl: card.cardImageUrl }, fortune, game };
         await setDailyFortuneCache(steamId, payload);
+        await appendDailyFortuneGameHistory(steamId, payload.game.appId);
         sendJson(res, 200, payload);
       } catch (err) {
         const message = err?.message || 'Daily fortune failed';
