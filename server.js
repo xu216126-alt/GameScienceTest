@@ -307,9 +307,19 @@ const DAILY_FORTUNE_GAME_HISTORY_MAX = 14; // 最近 N 次本命游戏参与防�
 const DAILY_FORTUNE_GAME_HISTORY_TTL_SEC = 30 * 86400; // 30 天
 const DAILY_FORTUNE_GAME_HISTORY_FALLBACK = new Map(); // 无 Redis 时内存兜底
 
-/** 当日日期串（UTC），用于塔罗缓存键与抽牌/候选种子，保证每日更新 */
+/** 当日日期串（UTC），用于塔罗缓存键与抽牌/候选种子；无客户端日期时使用 */
 function getDailyFortuneDateString() {
   return new Date().toISOString().slice(0, 10);
+}
+
+/** 校验并返回客户端传来的本地日期 YYYY-MM-DD；无效则返回 null，由调用方回退到 UTC 日 */
+function parseClientDateString(value) {
+  const s = typeof value === 'string' ? value.trim() : '';
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(s)) return null;
+  const [y, m, d] = s.split('-').map(Number);
+  const date = new Date(y, m - 1, d);
+  if (date.getFullYear() !== y || date.getMonth() !== m - 1 || date.getDate() !== d) return null;
+  return s;
 }
 
 /**
@@ -1053,11 +1063,11 @@ async function setProfileDiff(steamId, diff) {
 
 const DAILY_FORTUNE_FALLBACK_CACHE = new Map();
 
-async function getDailyFortuneCache(steamId) {
+async function getDailyFortuneCache(steamId, dateStr = null) {
   if (!steamId) return null;
-  const dateStr = getDailyFortuneDateString();
-  const cacheKey = `${DAILY_FORTUNE_KEY_PREFIX}${steamId}:${dateStr}`;
-  const memoryKey = `${steamId}:${dateStr}`;
+  const useDateStr = dateStr || getDailyFortuneDateString();
+  const cacheKey = `${DAILY_FORTUNE_KEY_PREFIX}${steamId}:${useDateStr}`;
+  const memoryKey = `${steamId}:${useDateStr}`;
   if (redisClient && redisHealthy) {
     try {
       const raw = await redisClient.get(cacheKey);
@@ -1072,11 +1082,11 @@ async function getDailyFortuneCache(steamId) {
   return null;
 }
 
-async function setDailyFortuneCache(steamId, data) {
+async function setDailyFortuneCache(steamId, data, dateStr = null) {
   if (!steamId || !data) return;
-  const dateStr = getDailyFortuneDateString();
-  const cacheKey = `${DAILY_FORTUNE_KEY_PREFIX}${steamId}:${dateStr}`;
-  const memoryKey = `${steamId}:${dateStr}`;
+  const useDateStr = dateStr || getDailyFortuneDateString();
+  const cacheKey = `${DAILY_FORTUNE_KEY_PREFIX}${steamId}:${useDateStr}`;
+  const memoryKey = `${steamId}:${useDateStr}`;
   if (redisClient && redisHealthy) {
     try {
       await redisClient.set(cacheKey, JSON.stringify(data), { EX: DAILY_FORTUNE_TTL_SEC });
@@ -1121,17 +1131,17 @@ async function appendDailyFortuneGameHistory(steamId, appId) {
   DAILY_FORTUNE_GAME_HISTORY_FALLBACK.set(steamId, next);
 }
 
-/** Deterministic card index for steamId + today (UTC date). Same user same day = same card; different user or day = different card. */
-function pickCardForUser(steamId) {
-  const dateStr = getDailyFortuneDateString();
+/** Deterministic card index for steamId + dateStr（同用户同 dateStr = 同牌）. dateStr 为客户端本地日期或 UTC 日。 */
+function pickCardForUser(steamId, dateStr = null) {
+  const useDateStr = dateStr || getDailyFortuneDateString();
   let hash = 0;
-  const str = `${steamId}:${dateStr}`;
+  const str = `${steamId}:${useDateStr}`;
   for (let i = 0; i < str.length; i++) hash = ((hash << 5) - hash + str.charCodeAt(i)) | 0;
   const index = Math.abs(hash) % CYBER_TAROT_DECK.length;
   return CYBER_TAROT_DECK[index];
 }
 
-async function getCandidateGamesForFortune(steamId, lang = 'zh-CN') {
+async function getCandidateGamesForFortune(steamId, lang = 'zh-CN', dateStr = null) {
   const ownedAppIds = [];
   try {
     const profile = getCachedAnalysisProfile(steamId, lang);
@@ -1139,8 +1149,8 @@ async function getCandidateGamesForFortune(steamId, lang = 'zh-CN') {
   } catch {
     // ignore
   }
-  const dateStr = getDailyFortuneDateString();
-  const seedHint = `${steamId}:${dateStr}`;
+  const useDateStr = dateStr || getDailyFortuneDateString();
+  const seedHint = `${steamId}:${useDateStr}`;
   const fallbackIds = await getFallbackPoolGamesFromRedis(
     ownedAppIds,
     [],
@@ -3743,12 +3753,14 @@ const server = http.createServer(async (req, res) => {
     if (pathname === '/api/daily-fortune' && req.method === 'GET') {
       const steamId = (requestUrl.searchParams.get('steamId') || '').trim();
       const lang = normalizeLang(requestUrl.searchParams.get('lang') || 'zh-CN');
+      const clientDate = parseClientDateString(requestUrl.searchParams.get('date') || '');
+      const dateStr = clientDate || getDailyFortuneDateString();
       if (!/^\d{17}$/.test(steamId)) {
         sendJson(res, 400, { error: 'Invalid or missing steamId. Use a 17-digit SteamID64.' });
         return;
       }
       try {
-        const cached = await getDailyFortuneCache(steamId);
+        const cached = await getDailyFortuneCache(steamId, dateStr);
         if (cached && cached.card && (cached.fortune || cached.fortuneText) && cached.game) {
           let cardPayload = cached.card;
           if (!cardPayload.cardImageUrl && (cardPayload.cardId || cardPayload.id)) {
@@ -3766,9 +3778,9 @@ const server = http.createServer(async (req, res) => {
           });
           return;
         }
-        const card = pickCardForUser(steamId);
+        const card = pickCardForUser(steamId, dateStr);
         const activityDiff = await getProfileDiff(steamId);
-        const candidates = await getCandidateGamesForFortune(steamId, lang);
+        const candidates = await getCandidateGamesForFortune(steamId, lang, dateStr);
         if (!candidates.length) {
           sendJson(res, 503, { error: 'No candidate games available for fortune.' });
           return;
@@ -3793,7 +3805,7 @@ const server = http.createServer(async (req, res) => {
           steamUrl: details.steamUrl,
         };
         const payload = { card: { cardId: card.cardId, cardName: card.cardName, cardImageUrl: card.cardImageUrl }, fortune, game };
-        await setDailyFortuneCache(steamId, payload);
+        await setDailyFortuneCache(steamId, payload, dateStr);
         await appendDailyFortuneGameHistory(steamId, payload.game.appId);
         sendJson(res, 200, payload);
       } catch (err) {

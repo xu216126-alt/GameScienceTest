@@ -2088,7 +2088,7 @@ function handleTarotCardClick() {
     return;
   }
   if (tarotLoading) tarotLoading.classList.remove("is-hidden");
-  fetch(`/api/daily-fortune?steamId=${encodeURIComponent(steamId)}&lang=zh-CN`)
+  fetch(`/api/daily-fortune?steamId=${encodeURIComponent(steamId)}&lang=zh-CN&date=${encodeURIComponent(getTodayDateString())}`)
     .then((res) => res.json())
     .then((data) => {
       if (data.error) throw new Error(data.error);
