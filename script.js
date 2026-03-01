@@ -952,6 +952,12 @@ function applyAiResult(ai, order = null, options = {}) {
   renderTags(ai.playstyleTags || []);
   currentScenarioData = ai.scenarios || fallbackScenarioData;
   currentScenarioOrder = order;
+  // [DEBUG] 排查列表不显示：确认赋值后 currentScenarioData 是否有 name/media
+  console.log("[DEBUG] applyAiResult 赋值后", {
+    hasScenarios: !!currentScenarioData,
+    firstKey: currentScenarioData ? Object.keys(currentScenarioData)[0] : null,
+    firstGame: currentScenarioData?.trendingOnline?.games?.[0],
+  });
   renderRecommendations(currentScenarioData, currentScenarioOrder);
   collectScenarioAppIds(currentScenarioData).forEach((id) => recommendationHistory.add(id));
   if (currentSteamId) savePersistedHistoryForSteamId(currentSteamId);
@@ -1119,6 +1125,10 @@ function runTypewriter(target, text, speed = 16) {
 }
 
 function createGameCard(game, revealIndex) {
+  if (typeof createGameCard._logCount === "undefined") createGameCard._logCount = 0;
+  if (createGameCard._logCount++ < 3) {
+    console.log("[DEBUG] createGameCard 收到的 game", { appId: game.appId, name: game.name, media: game.media, hasHeaderImage: !!game.headerImage });
+  }
   const card = document.createElement("article");
   card.className = "game-card";
   card.dataset.appId = String(game.appId);
@@ -1311,6 +1321,15 @@ function renderRecommendations(scenarios = currentScenarioData, forcedOrder = cu
 
   let cardIndex = 0;
   const keys = forcedOrder && forcedOrder.length ? forcedOrder : Object.keys(scenarios || {});
+  // [DEBUG] 排查列表不显示：确认渲染时拿到的 scenarios 和第一个 game
+  const firstKey = keys[0];
+  const firstGame = firstKey && scenarios?.[firstKey]?.games?.[0];
+  console.log("[DEBUG] renderRecommendations 入参", {
+    keysCount: keys.length,
+    firstKey,
+    firstGame,
+    isAnalyzing,
+  });
   keys.forEach((key) => {
     const data = scenarios?.[key];
     if (!data) return;
@@ -1562,6 +1581,12 @@ async function fetchAiAnalysis(steamId, profileHint, refreshToken = "", refreshO
   });
   const data = await response.json();
   if (!response.ok) throw new Error(data.error || "AI analysis failed.");
+  // [DEBUG] 排查列表不显示：确认接口返回里是否有 name/media
+  console.log("[DEBUG] ai-analysis 响应 sample", {
+    hasScenarios: !!data?.scenarios,
+    firstKey: data?.scenarios ? Object.keys(data.scenarios)[0] : null,
+    firstGame: data?.scenarios?.trendingOnline?.games?.[0],
+  });
   return data;
 }
 
