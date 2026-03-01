@@ -1,6 +1,8 @@
 "use strict";
 Object.defineProperty(exports, "__esModule", { value: true });
+exports.STEAM_HEADER_CDN = void 0;
 exports.init = init;
+exports.normalizeGameData = normalizeGameData;
 exports.getGamesMeta = getGamesMeta;
 exports.getGamesMetaMap = getGamesMetaMap;
 exports.getGamesMetaMapCacheOnly = getGamesMetaMapCacheOnly;
@@ -20,6 +22,7 @@ const CONCURRENCY = 3;
 const CACHE_KEY_PREFIX = 'steam_store_meta:';
 const CACHE_TTL_SEC = 24 * 60 * 60; // 24h
 let fetchJsonFn = null;
+let fetchWithStatusFn = null;
 let getRedisFn = null;
 let getRedisHealthyFn = null;
 let steamStoreBaseUrl = 'https://store.steampowered.com';
@@ -32,6 +35,7 @@ function normalizeLang(lang) {
 }
 function init(config) {
     fetchJsonFn = config.fetchJson;
+    fetchWithStatusFn = config.fetchWithStatus ?? null;
     getRedisFn = config.getRedisClient;
     getRedisHealthyFn = config.getRedisHealthy ?? null;
     steamStoreBaseUrl = (config.steamStoreBaseUrl || process.env.STEAM_STORE_BASE_URL || 'https://store.steampowered.com').replace(/\/$/, '');
@@ -42,11 +46,73 @@ function init(config) {
     onCacheMiss = config.onCacheMiss ?? null;
 }
 function ensureInit() {
-    if (!fetchJsonFn || !storeLocaleForLangFn) {
+    if ((!fetchJsonFn && !fetchWithStatusFn) || !storeLocaleForLangFn) {
         throw new Error('storeService not initialized: call storeService.init(config) first');
     }
 }
+/** Static image URL for every game; do not wait for Steam Store API. */
 const STEAM_HEADER_CDN = (appId) => `https://shared.fastly.steamstatic.com/store_item_assets/steam/apps/${appId}/header.jpg`;
+exports.STEAM_HEADER_CDN = STEAM_HEADER_CDN;
+/**
+ * Normalize game data from Redis (SteamSpy) + optional Steam API.
+ * Name: steamApiData.name (e.g. Chinese) > redisData.name (English) > 'Unknown Game'.
+ * Image: always CDN URL (static injection).
+ * Price: SteamSpy price/initialprice when present.
+ * Tags: Steam API genres when present, else Object.keys(redisData.tags || {}).
+ */
+function normalizeGameData(appId, redisData, steamApiData) {
+    const id = Number(appId);
+    const steamMeta = steamApiData && typeof steamApiData.appId === 'number'
+        ? steamApiData
+        : null;
+    const steamRaw = steamMeta
+        ? null
+        : steamApiData;
+    const name = (steamMeta?.name && !/^App\s+\d+$/i.test(steamMeta.name))
+        ? steamMeta.name
+        : (redisData?.name && !/^App\s+\d+$/i.test(String(redisData.name)))
+            ? String(redisData.name).trim()
+            : 'Unknown Game';
+    const priceFromRedis = redisData?.price !== undefined && redisData?.price !== ''
+        ? String(redisData.price)
+        : redisData?.initialprice !== undefined && redisData?.initialprice !== ''
+            ? String(redisData.initialprice)
+            : null;
+    const isFree = Boolean(steamMeta?.isFree ??
+        (steamRaw ? steamRaw.is_free : undefined) ??
+        (priceFromRedis === '0' || priceFromRedis === '0.00' ? true : undefined));
+    const price = isFree ? 'Free' : (priceFromRedis ?? steamMeta?.price ?? steamRaw?.price_overview?.final_formatted ?? 'N/A');
+    const genresFromSteam = steamMeta?.genres?.length
+        ? steamMeta.genres
+        : Array.isArray(steamRaw?.genres)
+            ? (steamRaw.genres.map((g) => String(g?.description ?? '')).filter(Boolean))
+            : [];
+    const tagsFromRedis = redisData?.tags && typeof redisData.tags === 'object' ? Object.keys(redisData.tags) : [];
+    const genres = genresFromSteam.length > 0 ? genresFromSteam : tagsFromRedis;
+    const pos = Number(redisData?.positive ?? 0);
+    const neg = Number(redisData?.negative ?? 0);
+    const total = pos + neg;
+    const positiveRate = total > 0 ? `${Math.round((pos / total) * 100)}%` : (steamMeta?.positiveRate ?? 'N/A');
+    const ccu = Number(redisData?.ccu ?? 0);
+    const currentPlayers = ccu > 0 ? `${ccu.toLocaleString()} online` : (steamMeta?.currentPlayers ?? 'N/A');
+    return {
+        appId: id,
+        appType: steamMeta?.appType ?? (steamRaw ? String(steamRaw.type || '') : 'game'),
+        name,
+        posterImage: steamMeta?.posterImage ?? `https://cdn.akamai.steamstatic.com/steam/apps/${id}/library_600x900.jpg`,
+        headerImage: (0, exports.STEAM_HEADER_CDN)(id),
+        shortDescription: (steamMeta?.shortDescription ?? ((steamRaw ? String(steamRaw.short_description ?? '') : '') || 'Detailed description is temporarily unavailable for this game.')),
+        trailerUrl: steamMeta?.trailerUrl ?? '',
+        trailerPoster: steamMeta?.trailerPoster ?? '',
+        genres,
+        releaseDate: steamMeta?.releaseDate ?? (steamRaw ? steamRaw.release_date?.date ?? 'Unknown' : 'Unknown'),
+        isFree: Boolean(isFree),
+        price,
+        positiveRate,
+        currentPlayers,
+        steamUrl: `https://store.steampowered.com/app/${id}`,
+    };
+}
 function buildGameMeta(appId, data) {
     const id = Number(appId);
     return {
@@ -54,7 +120,7 @@ function buildGameMeta(appId, data) {
         appType: String(data.type || ''),
         name: data.name || `App ${id}`,
         posterImage: `https://cdn.akamai.steamstatic.com/steam/apps/${id}/library_600x900.jpg`,
-        headerImage: data.header_image || STEAM_HEADER_CDN(id),
+        headerImage: (0, exports.STEAM_HEADER_CDN)(id),
         shortDescription: data.short_description || 'Detailed description is temporarily unavailable for this game.',
         trailerUrl: (() => {
             const m = data.movies?.[0];
@@ -71,13 +137,26 @@ function buildGameMeta(appId, data) {
     };
 }
 async function fetchAppDetailsBatch(appIds, lang) {
-    if (!appIds.length || !fetchJsonFn)
+    if (!appIds.length)
+        return {};
+    const hasFetch = fetchWithStatusFn ?? fetchJsonFn;
+    if (!hasFetch)
         return {};
     onSteamStoreCall?.();
     const locale = storeLocaleForLangFn(normalizeLang(lang));
     const idsParam = appIds.slice(0, BATCH_SIZE).join(',');
     const url = `${steamStoreBaseUrl}/api/appdetails?appids=${idsParam}&cc=${locale.cc}&l=${locale.l}`;
-    const data = await fetchJsonFn(url).catch(() => null);
+    let data = null;
+    if (fetchWithStatusFn) {
+        const { status, data: body } = await fetchWithStatusFn(url).catch(() => ({ status: 0, data: null }));
+        if (status === 429 || status === 503) {
+            return {};
+        }
+        data = body;
+    }
+    else {
+        data = await (fetchJsonFn(url).catch(() => null));
+    }
     if (!data || typeof data !== 'object')
         return {};
     const out = {};

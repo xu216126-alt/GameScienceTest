@@ -1462,6 +1462,16 @@ storeService.init({
   onSteamStoreCall: () => metricsService.recordSteamStoreCall(),
   onCacheHit: () => metricsService.recordCacheHit(),
   onCacheMiss: () => metricsService.recordCacheMiss(),
+  // On 429, return empty so storeService does not throw; caller fills from Redis + static image.
+  fetchWithStatus: async (url) => {
+    try {
+      const data = await fetchJson(url);
+      return { status: 200, data };
+    } catch (e) {
+      if (e && e.upstreamStatus === 429) return { status: 429, data: null };
+      throw e;
+    }
+  },
 });
 storeService.setGetTopAppIdsForSyncImpl(getSteamSpyTopAppIdsForStoreSync);
 
@@ -2293,35 +2303,9 @@ async function getSteamSpyMetaFromRedis(redis, appIds) {
 const STEAM_HEADER_CDN = (appId) =>
   `https://shared.fastly.steamstatic.com/store_item_assets/steam/apps/${appId}/header.jpg`;
 
-/** 用 steam_meta（SteamSpy 同步数据）拼出前端期望的 GameMeta 形状；无 header_image 时用 Steam CDN 公式。 */
+/** 用 steam_meta（SteamSpy）拼出 GameMeta；统一走 storeService.normalizeGameData（名称/价格/标签/静态头图）。 */
 function buildGameMetaFromSteamSpy(appId, spyMeta) {
-  const id = Number(appId);
-  const name = (spyMeta?.name && !/^App\s+\d+$/i.test(String(spyMeta.name)))
-    ? String(spyMeta.name).trim()
-    : `App ${id}`;
-  const pos = Number(spyMeta?.positive) || 0;
-  const neg = Number(spyMeta?.negative) || 0;
-  const total = pos + neg;
-  const positiveRate = total > 0 ? `${Math.round((pos / total) * 100)}%` : 'N/A';
-  const ccu = Number(spyMeta?.ccu) || 0;
-  const currentPlayers = ccu > 0 ? `${ccu.toLocaleString()} online` : 'N/A';
-  return {
-    appId: id,
-    appType: 'game',
-    name,
-    posterImage: `https://cdn.akamai.steamstatic.com/steam/apps/${id}/library_600x900.jpg`,
-    headerImage: STEAM_HEADER_CDN(id),
-    shortDescription: 'Detailed description is temporarily unavailable for this game.',
-    trailerUrl: '',
-    trailerPoster: '',
-    genres: [],
-    releaseDate: 'Unknown',
-    isFree: false,
-    price: 'N/A',
-    positiveRate,
-    currentPlayers,
-    steamUrl: `https://store.steampowered.com/app/${id}`,
-  };
+  return storeService.normalizeGameData(Number(appId), spyMeta || null, null);
 }
 
 /** 仅用 steam_meta（单次 mget），不请求 Store。用于 preflight 快速响应；缺数据的用最小卡片（name + CDN 图）。 */
@@ -2335,68 +2319,42 @@ async function getGamesMetaMapSteamSpyOnly(appIds) {
     for (const id of unique) {
       const spy = steamSpyMeta.get(id);
       if (spy) map.set(id, buildGameMetaFromSteamSpy(id, spy));
-      else
-        map.set(id, {
-          appId: id,
-          appType: 'game',
-          name: `App ${id}`,
-          posterImage: `https://cdn.akamai.steamstatic.com/steam/apps/${id}/library_600x900.jpg`,
-          headerImage: STEAM_HEADER_CDN(id),
-          shortDescription: 'Detailed description is temporarily unavailable for this game.',
-          trailerUrl: '',
-          trailerPoster: '',
-          genres: [],
-          releaseDate: 'Unknown',
-          isFree: false,
-          price: 'N/A',
-          positiveRate: 'N/A',
-          currentPlayers: 'N/A',
-          steamUrl: `https://store.steampowered.com/app/${id}`,
-        });
+      else map.set(id, storeService.normalizeGameData(id, null, null));
     }
   } else {
     for (const id of unique) {
-      map.set(id, {
-        appId: id,
-        appType: 'game',
-        name: `App ${id}`,
-        posterImage: `https://cdn.akamai.steamstatic.com/steam/apps/${id}/library_600x900.jpg`,
-        headerImage: STEAM_HEADER_CDN(id),
-        shortDescription: 'Detailed description is temporarily unavailable for this game.',
-        trailerUrl: '',
-        trailerPoster: '',
-        genres: [],
-        releaseDate: 'Unknown',
-        isFree: false,
-        price: 'N/A',
-        positiveRate: 'N/A',
-        currentPlayers: 'N/A',
-        steamUrl: `https://store.steampowered.com/app/${id}`,
-      });
+      map.set(id, storeService.normalizeGameData(id, null, null));
     }
   }
   return map;
 }
 
-/** 先查 steam_meta:{appid} 作为 base，仅对没有 steam_meta 的 appId 请求 Steam Store API。 */
+/** 先查 steam_meta:{appid}（单次 mget），仅对缺失的请求 Steam；429 时不抛错，用 Redis + 静态头图补全，保证卡片不空。 */
 async function getGamesMetaMapWithSteamSpyFirst(appIds, lang) {
   const unique = [...new Set((appIds || []).map((id) => Number(id)).filter((id) => Number.isInteger(id) && id > 0))];
   if (unique.length === 0) return new Map();
   const map = new Map();
   const redis = redisClient && redisHealthy ? redisClient : null;
+  let steamSpyMeta = new Map();
   if (redis) {
-    const steamSpyMeta = await getSteamSpyMetaFromRedis(redis, unique);
+    steamSpyMeta = await getSteamSpyMetaFromRedis(redis, unique);
     for (const id of unique) {
       const spy = steamSpyMeta.get(id);
-      if (spy) map.set(id, buildGameMetaFromSteamSpy(id, spy));
+      if (spy) map.set(id, storeService.normalizeGameData(id, spy, null));
     }
   }
   const missIds = unique.filter((id) => !map.has(id));
   if (missIds.length > 0) {
     const storeMap = await storeService.getGamesMetaMap(missIds, lang);
     storeMap.forEach((meta, id) => {
-      if (meta && meta.name && !/^App\s+\d+$/i.test(meta.name)) map.set(id, meta);
+      if (meta && meta.name && !/^App\s+\d+$/i.test(meta.name)) {
+        map.set(id, storeService.normalizeGameData(id, steamSpyMeta.get(id) || null, meta));
+      }
     });
+    // Smart fallback: on 429 or partial failure, fill missing from Redis + static image so cards always show.
+    for (const id of missIds) {
+      if (!map.has(id)) map.set(id, storeService.normalizeGameData(id, steamSpyMeta.get(id) || null, null));
+    }
   }
   return map;
 }

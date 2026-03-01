@@ -36,9 +36,12 @@ interface StoreLocale {
 }
 
 type FetchJson = (url: string) => Promise<unknown>;
+/** When provided, used for Store API calls; on 429 we return empty batch and do not throw. */
+type FetchWithStatus = (url: string) => Promise<{ status: number; data: unknown }>;
 type GetRedis = () => { get: (k: string) => Promise<string | null>; set: (k: string, v: string, opts?: { EX?: number }) => Promise<unknown> } | null;
 
 let fetchJsonFn: FetchJson | null = null;
+let fetchWithStatusFn: FetchWithStatus | null = null;
 let getRedisFn: GetRedis | null = null;
 let getRedisHealthyFn: (() => boolean) | null = null;
 let steamStoreBaseUrl = 'https://store.steampowered.com';
@@ -60,8 +63,11 @@ export function init(config: {
   onSteamStoreCall?: () => void;
   onCacheHit?: () => void;
   onCacheMiss?: () => void;
+  /** Optional: return { status, data }; on 429 we do not throw and return empty batch so caller can use Redis + static image. */
+  fetchWithStatus?: FetchWithStatus;
 }): void {
   fetchJsonFn = config.fetchJson;
+  fetchWithStatusFn = config.fetchWithStatus ?? null;
   getRedisFn = config.getRedisClient;
   getRedisHealthyFn = config.getRedisHealthy ?? null;
   steamStoreBaseUrl = (config.steamStoreBaseUrl || process.env.STEAM_STORE_BASE_URL || 'https://store.steampowered.com').replace(/\/$/, '');
@@ -72,13 +78,101 @@ export function init(config: {
 }
 
 function ensureInit(): void {
-  if (!fetchJsonFn || !storeLocaleForLangFn) {
+  if ((!fetchJsonFn && !fetchWithStatusFn) || !storeLocaleForLangFn) {
     throw new Error('storeService not initialized: call storeService.init(config) first');
   }
 }
 
-const STEAM_HEADER_CDN = (appId: number) =>
+/** Static image URL for every game; do not wait for Steam Store API. */
+export const STEAM_HEADER_CDN = (appId: number) =>
   `https://shared.fastly.steamstatic.com/store_item_assets/steam/apps/${appId}/header.jpg`;
+
+/** SteamSpy/redis steam_meta shape (partial). */
+export interface SteamSpyMeta {
+  name?: string;
+  price?: string;
+  initialprice?: string;
+  tags?: Record<string, string>;
+  positive?: number;
+  negative?: number;
+  ccu?: number;
+}
+
+/**
+ * Normalize game data from Redis (SteamSpy) + optional Steam API.
+ * Name: steamApiData.name (e.g. Chinese) > redisData.name (English) > 'Unknown Game'.
+ * Image: always CDN URL (static injection).
+ * Price: SteamSpy price/initialprice when present.
+ * Tags: Steam API genres when present, else Object.keys(redisData.tags || {}).
+ */
+export function normalizeGameData(
+  appId: number,
+  redisData: SteamSpyMeta | null,
+  steamApiData: GameMeta | Record<string, unknown> | null
+): GameMeta {
+  const id = Number(appId);
+  const steamMeta = steamApiData && typeof (steamApiData as GameMeta).appId === 'number'
+    ? (steamApiData as GameMeta)
+    : null;
+  const steamRaw = steamMeta
+    ? null
+    : (steamApiData as Record<string, unknown> | null);
+
+  const name =
+    (steamMeta?.name && !/^App\s+\d+$/i.test(steamMeta.name))
+      ? steamMeta.name
+      : (redisData?.name && !/^App\s+\d+$/i.test(String(redisData.name)))
+        ? String(redisData.name).trim()
+        : 'Unknown Game';
+
+  const priceFromRedis =
+    redisData?.price !== undefined && redisData?.price !== ''
+      ? String(redisData.price)
+      : redisData?.initialprice !== undefined && redisData?.initialprice !== ''
+        ? String(redisData.initialprice)
+        : null;
+  const isFree = Boolean(
+    steamMeta?.isFree ??
+    (steamRaw ? (steamRaw as { is_free?: boolean }).is_free : undefined) ??
+    (priceFromRedis === '0' || priceFromRedis === '0.00' ? true : undefined)
+  );
+  const price =
+    isFree ? 'Free' : (priceFromRedis ?? steamMeta?.price ?? (steamRaw as { price_overview?: { final_formatted?: string } })?.price_overview?.final_formatted ?? 'N/A');
+
+  const genresFromSteam =
+    steamMeta?.genres?.length
+      ? steamMeta.genres
+      : Array.isArray((steamRaw as { genres?: { description?: string }[] })?.genres)
+        ? ((steamRaw as { genres: { description?: string }[] }).genres.map((g) => String(g?.description ?? '')).filter(Boolean))
+        : [];
+  const tagsFromRedis = redisData?.tags && typeof redisData.tags === 'object' ? Object.keys(redisData.tags) : [];
+  const genres = genresFromSteam.length > 0 ? genresFromSteam : tagsFromRedis;
+
+  const pos = Number(redisData?.positive ?? 0);
+  const neg = Number(redisData?.negative ?? 0);
+  const total = pos + neg;
+  const positiveRate = total > 0 ? `${Math.round((pos / total) * 100)}%` : (steamMeta?.positiveRate ?? 'N/A');
+  const ccu = Number(redisData?.ccu ?? 0);
+  const currentPlayers = ccu > 0 ? `${ccu.toLocaleString()} online` : (steamMeta?.currentPlayers ?? 'N/A');
+
+  return {
+    appId: id,
+    appType: steamMeta?.appType ?? (steamRaw ? String((steamRaw as { type?: string }).type || '') : 'game'),
+    name,
+    posterImage: steamMeta?.posterImage ?? `https://cdn.akamai.steamstatic.com/steam/apps/${id}/library_600x900.jpg`,
+    headerImage: STEAM_HEADER_CDN(id),
+    shortDescription: (steamMeta?.shortDescription ?? ((steamRaw ? String((steamRaw as { short_description?: string }).short_description ?? '') : '') || 'Detailed description is temporarily unavailable for this game.')),
+    trailerUrl: steamMeta?.trailerUrl ?? '',
+    trailerPoster: steamMeta?.trailerPoster ?? '',
+    genres,
+    releaseDate: steamMeta?.releaseDate ?? (steamRaw ? (steamRaw as { release_date?: { date?: string } }).release_date?.date ?? 'Unknown' : 'Unknown'),
+    isFree: Boolean(isFree),
+    price,
+    positiveRate,
+    currentPlayers,
+    steamUrl: `https://store.steampowered.com/app/${id}`,
+  };
+}
 
 function buildGameMeta(appId: number, data: Record<string, unknown>): GameMeta {
   const id = Number(appId);
@@ -87,7 +181,7 @@ function buildGameMeta(appId: number, data: Record<string, unknown>): GameMeta {
     appType: String(data.type || ''),
     name: (data.name as string) || `App ${id}`,
     posterImage: `https://cdn.akamai.steamstatic.com/steam/apps/${id}/library_600x900.jpg`,
-    headerImage: (data.header_image as string) || STEAM_HEADER_CDN(id),
+    headerImage: STEAM_HEADER_CDN(id),
     shortDescription: (data.short_description as string) || 'Detailed description is temporarily unavailable for this game.',
     trailerUrl: (() => {
       const m = (data.movies as { mp4?: { max?: string; '480'?: string }; thumbnail?: string }[])?.[0];
@@ -105,12 +199,24 @@ function buildGameMeta(appId: number, data: Record<string, unknown>): GameMeta {
 }
 
 async function fetchAppDetailsBatch(appIds: number[], lang: string): Promise<Record<number, GameMeta>> {
-  if (!appIds.length || !fetchJsonFn) return {};
+  if (!appIds.length) return {};
+  const hasFetch = fetchWithStatusFn ?? fetchJsonFn;
+  if (!hasFetch) return {};
   onSteamStoreCall?.();
   const locale = storeLocaleForLangFn(normalizeLang(lang));
   const idsParam = appIds.slice(0, BATCH_SIZE).join(',');
   const url = `${steamStoreBaseUrl}/api/appdetails?appids=${idsParam}&cc=${locale.cc}&l=${locale.l}`;
-  const data = await fetchJsonFn(url).catch(() => null) as Record<string, { success?: boolean; data?: Record<string, unknown> }> | null;
+
+  let data: Record<string, { success?: boolean; data?: Record<string, unknown> }> | null = null;
+  if (fetchWithStatusFn) {
+    const { status, data: body } = await fetchWithStatusFn(url).catch(() => ({ status: 0, data: null }));
+    if (status === 429 || status === 503) {
+      return {};
+    }
+    data = body as Record<string, { success?: boolean; data?: Record<string, unknown> }> | null;
+  } else {
+    data = await (fetchJsonFn!(url).catch(() => null)) as Record<string, { success?: boolean; data?: Record<string, unknown> }> | null;
+  }
   if (!data || typeof data !== 'object') return {};
   const out: Record<number, GameMeta> = {};
   for (const id of appIds) {
